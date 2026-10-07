@@ -1,0 +1,507 @@
+#!/bin/sh
+# luci-app-xxwan —— 在线安装 / 升级 / 卸载
+#
+# 用法:
+#   xxwan-install install                首次安装
+#   xxwan-install upgrade                升级（默认保留配置）
+#   xxwan-install uninstall              卸载（默认保留配置）
+#   xxwan-install info                   探测本机环境与安装状态
+#
+# 选项:
+#   --keep-config            保留 /etc/config/xxwan（升级/卸载的默认行为）
+#   --no-keep-config         不保留：升级即恢复出厂默认，卸载连配置一起清
+#   --from=<路径>            本地介质：源码 .tar.gz 或项目目录（调试用）
+#   --branch=<main>          指定分支，默认 main
+#   --mirror=<前缀>          下载镜像前缀，如 https://ghfast.top/
+#   --force                  已安装也继续装
+#   --yes                    非交互，所有询问取默认值
+#
+# 新机器一条命令安装:
+#   wget -O /tmp/xxwan-install \
+#     https://raw.githubusercontent.com/xxosdev/luci-app-xxwan/main/root/usr/sbin/xxwan-install
+#   sh /tmp/xxwan-install install
+#
+# ★ 为什么不用 install -d/-m：OpenWrt 的 busybox 没有 install 小程序，
+#   一律用 mkdir -p + cp + chmod。
+#
+# ★ 为什么卸载要按内置清单逐个删：包数据库的版本可能与实际文件不一致
+#   （手动覆盖过就对不上），apk del / opkg remove 会按旧清单删、漏掉新文件。
+#   所以包管理器删完必须按清单补扫一遍。
+#
+# ★ 配置文件处理：/etc/config/xxwan 属于用户数据，安装时只在不存在时创建，
+#   升级时一律保留（与 opkg 的 conffile 行为一致）；只有 --no-keep-config 才覆盖/删除。
+
+set -e
+
+REPO="xxosdev/luci-app-xxwan"
+BRANCH="main"
+CONF="/etc/config/xxwan"
+KEEP_DIR="/etc/xxwan-config.keep"
+INIT="/etc/init.d/xxwan"
+WORK=""
+
+# 内置文件清单（相对根目录；与 Makefile 的 install 段一一对应）
+MANIFEST="
+etc/config/xxwan
+etc/init.d/xxwan
+usr/sbin/xxwan-daemon
+usr/sbin/xxwan-install
+usr/lib/lua/luci/controller/xxwan.lua
+usr/lib/lua/luci/model/cbi/xxwan/basic.lua
+usr/lib/lua/luci/model/cbi/xxwan/iface.lua
+usr/lib/lua/luci/model/cbi/xxwan/rule.lua
+usr/lib/lua/luci/model/cbi/xxwan/advanced.lua
+usr/lib/lua/luci/model/cbi/xxwan/log.lua
+usr/lib/lua/luci/model/cbi/xxwan/backup.lua
+usr/lib/lua/luci/model/cbi/xxwan/about.lua
+"
+
+# 这些是可执行文件，需要 755；其余 644
+EXECS="
+etc/init.d/xxwan
+usr/sbin/xxwan-daemon
+usr/sbin/xxwan-install
+"
+
+OPT_KEEP="default"
+OPT_FROM=""
+OPT_MIRROR=""
+OPT_FORCE=0
+OPT_YES=0
+# 覆盖文件前服务是否在跑：在跑的话装完要重启一次加载新代码
+WAS_RUNNING=0
+
+# ============ 小工具 ============
+log()  { printf '%s\n' "$*"; }
+warn() { printf '警告: %s\n' "$*" >&2; }
+die()  { printf '错误: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+	# set -e 下裸写 `[ -n "$WORK" ] && rm -rf ...` 在 WORK 为空时整体返回非 0 会终止清理，
+	# 必须用 if
+	if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+	return 0
+}
+trap cleanup EXIT INT TERM
+
+is_exec() {
+	local f="$1" e
+	for e in $EXECS; do
+		if [ "$e" = "$f" ]; then return 0; fi
+	done
+	return 1
+}
+
+ask_yn() {
+	local q="$1" def="$2" ans
+	if [ "$OPT_YES" = 1 ]; then
+		if [ "$def" = y ]; then return 0; fi
+		return 1
+	fi
+	if [ ! -t 0 ]; then
+		warn "非交互环境，按默认回答: $q -> $def"
+		if [ "$def" = y ]; then return 0; fi
+		return 1
+	fi
+	printf '%s [y/N]: ' "$q"
+	read -r ans || ans=""
+	case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ============ 环境探测 ============
+detect_pm() {
+	if [ -r /lib/apk/db/installed ] || command -v apk >/dev/null 2>&1; then
+		echo apk
+	elif [ -r /usr/lib/opkg/status ] || command -v opkg >/dev/null 2>&1; then
+		echo opkg
+	else
+		echo none
+	fi
+}
+
+installed() { [ -x /usr/sbin/xxwan-daemon ] && [ -x "$INIT" ]; }
+
+scan_files() {
+	local present=0 missing=0 f
+	for f in $MANIFEST; do
+		if [ -e "/$f" ]; then present=$((present + 1)); else missing=$((missing + 1)); fi
+	done
+	echo "$present $missing"
+}
+
+check_deps() {
+	local miss=""
+	# ★ pbr 不提供同名命令，只装 /etc/init.d/pbr，不能靠 command -v 判断
+	if [ ! -x /etc/init.d/pbr ]; then miss="$miss pbr"; fi
+	command -v curl >/dev/null 2>&1 || miss="$miss curl"
+	command -v conntrack >/dev/null 2>&1 || miss="$miss conntrack"
+	if [ -n "$miss" ]; then
+		warn "缺少依赖:$miss"
+		warn "  pbr 提供策略路由底层，curl 用于 HTTP 探测与通知，conntrack 用于切换时清理连接。"
+		warn "  请先用软件包管理器安装（如 apk add pbr curl conntrack）。"
+		return 1
+	fi
+	return 0
+}
+
+# 旧版本配置迁移：flush_conntrack(0/1) -> conntrack_flush(always/restore/never)
+migrate_config() {
+	local old new
+	# ★ set -e 下 `var=$(cmd)` 会继承 cmd 的退出码，uci -q get 取不到时返回 1 会直接退出，
+	#   必须显式兜底
+	old=$(uci -q get xxwan.advanced.flush_conntrack 2>/dev/null || echo "")
+	if [ -n "$old" ]; then
+		new=$(uci -q get xxwan.advanced.conntrack_flush 2>/dev/null || echo "")
+		if [ -z "$new" ]; then
+			if [ "$old" = "1" ]; then
+				uci set xxwan.advanced.conntrack_flush=always
+			else
+				uci set xxwan.advanced.conntrack_flush=never
+			fi
+			log "    已迁移旧选项 flush_conntrack=$old -> conntrack_flush"
+		fi
+		uci -q delete xxwan.advanced.flush_conntrack
+		uci commit xxwan
+	fi
+	return 0
+}
+
+# ============ 下载 ============
+fetch() { # $1=url $2=dst
+	local url="$1" dst="$2"
+	[ -n "$url" ] || return 1
+	rm -f "$dst"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 10 --max-time 240 -o "$dst" "$url" && return 0
+	fi
+	if command -v wget >/dev/null 2>&1; then
+		wget -q -O "$dst" "$url" && return 0
+	fi
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -q -O "$dst" "$url" && return 0
+	fi
+	return 1
+}
+
+# 取源码包，成功则把解包后的项目目录写进 SRC_DIR
+SRC_DIR=""
+acquire() {
+	local f url dir
+	if [ -n "$OPT_FROM" ]; then
+		if [ -d "$OPT_FROM" ]; then
+			SRC_DIR="$OPT_FROM"
+			return 0
+		fi
+		if [ -f "$OPT_FROM" ]; then
+			mkdir -p "$WORK"
+			case "$OPT_FROM" in
+				*.tar.gz|*.tgz) tar xzf "$OPT_FROM" -C "$WORK" || die "解包失败: $OPT_FROM" ;;
+				*) die "不支持的本地介质: $OPT_FROM（支持 .tar.gz 或项目目录）" ;;
+			esac
+		else
+			die "--from 路径不存在: $OPT_FROM"
+		fi
+	else
+		url="${OPT_MIRROR}https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH"
+		f="$WORK/xxwan-src.tar.gz"
+		log "==> 下载 $url"
+		fetch "$url" "$f" || die "下载失败（可加 --mirror=https://ghfast.top/ 走镜像）"
+		[ -s "$f" ] || die "下载内容为空"
+		tar xzf "$f" -C "$WORK" || die "解包失败"
+	fi
+	# 定位含 root/ 的项目目录（GitHub codeload 顶层目录是 <repo>-<branch>）
+	dir=""
+	for d in "$WORK" "$WORK"/*; do
+		if [ -d "$d/root" ]; then dir="$d"; break; fi
+	done
+	[ -n "$dir" ] || die "解包后找不到 root/ 目录"
+	SRC_DIR="$dir"
+	return 0
+}
+
+# ============ 安装动作 ============
+
+# 守护进程是否在跑。★ 不用 `ps w | grep xxwan-daemon`：
+#   调用方常写成 `sh -c "... xxwan-daemon ..."`，那条 ash 自身的命令行就含这个字符串，
+#   会误判成「正在运行」。pidof 按进程名精确匹配，不受影响。
+daemon_running() {
+	if command -v pidof >/dev/null 2>&1; then
+		[ -n "$(pidof xxwan-daemon 2>/dev/null)" ]
+		return $?
+	fi
+	if command -v pgrep >/dev/null 2>&1; then
+		pgrep -x xxwan-daemon >/dev/null 2>&1
+		return $?
+	fi
+	# 两个都不可用（OpenWrt 上不会发生）：保守当作未运行
+	return 1
+}
+
+# ★ 覆盖可执行脚本前必须停掉它的进程，两个理由：
+#   1) 若以原地截断方式改写（`> file`、`cat > file`），运行中的 shell 读的是同一个 fd，
+#      会在下一轮读取时读到改写后的乱码。本脚本用 `cp -f`（先 unlink 再写，换 inode），
+#      对运行中进程本身安全，但停进程仍不能省 —— 见理由 2。
+#   2) 进程不重启就还在跑旧代码，覆盖等于没生效。
+#   顺带也规避了直接执行二进制时可能出现的 ETXTBSY（Text file busy）。
+#   记录「原本是否在跑」，装完据此决定要不要重启。
+stop_for_replace() {
+	local i=0
+	if daemon_running; then WAS_RUNNING=1; fi
+	if [ -x "$INIT" ]; then "$INIT" stop >/dev/null 2>&1 || true; fi
+	killall xxwan-daemon 2>/dev/null || true
+	while [ "$i" -lt 10 ]; do
+		if ! daemon_running; then break; fi
+		i=$((i + 1))
+		sleep 1
+	done
+	if daemon_running; then
+		warn "xxwan-daemon 仍在运行，覆盖文件可能失败（ETXTBSY）"
+	fi
+	return 0
+}
+
+install_files() { # $1=项目目录 $2=是否覆盖配置(1/0)
+	local src="$1" overwrite_conf="$2" f dst mode n=0 fail=0
+	for f in $MANIFEST; do
+		[ -f "$src/root/$f" ] || { warn "源包缺少 $f，跳过"; continue; }
+		dst="/$f"
+		# 配置文件：默认只在不存在时创建
+		if [ "$f" = "etc/config/xxwan" ] && [ "$overwrite_conf" != 1 ] && [ -f "$dst" ]; then
+			log "    保留现有配置 $dst"
+			continue
+		fi
+		mkdir -p "$(dirname "$dst")"
+		if ! cp -f "$src/root/$f" "$dst" 2>/dev/null; then
+			warn "写入失败: $dst"
+			fail=$((fail + 1))
+			continue
+		fi
+		if is_exec "$f"; then mode=755; else mode=644; fi
+		chmod "$mode" "$dst"
+		n=$((n + 1))
+	done
+	log "    已写入 $n 个文件"
+	[ "$fail" -eq 0 ] || die "有 $fail 个文件写入失败（多为 Text file busy：服务没停干净）"
+	return 0
+}
+
+new_default_hint() {
+	local f
+	for f in /etc/config/xxwan.apk-new /etc/config/xxwan-opkg; do
+		if [ -f "$f" ]; then
+			warn "检测到 $f：现有配置已保留，包内新默认值放在这个文件里（可自行删除）"
+		fi
+	done
+	return 0
+}
+
+post_install() {
+	chmod 755 "$INIT" /usr/sbin/xxwan-daemon /usr/sbin/xxwan-install 2>/dev/null || true
+	"$INIT" enable >/dev/null 2>&1 || true
+	migrate_config
+	# pbr 功能开关：未开则 xxwan 的分流规则不会生效
+	if command -v uci >/dev/null 2>&1; then
+		if [ "$(uci -q get pbr.config.enabled)" != "1" ]; then
+			warn "pbr 的功能开关当前为关闭状态（pbr.config.enabled=0），xxwan 的分流规则不会生效。"
+			warn "  可在 LuCI 的「网络 → XXWAN 多线策略 → 全局设置」页点击「启用并重启 PBR」。"
+		fi
+	fi
+	# 清 LuCI 缓存，菜单才会刷新
+	rm -f /tmp/luci-indexcache* 2>/dev/null || true
+	rm -rf /tmp/luci-modulecache 2>/dev/null || true
+
+	# 原来在跑 -> 重启一次让新代码生效；全新安装不主动启动，避免安装瞬间改变网络
+	if [ "$WAS_RUNNING" = 1 ]; then
+		log "    检测到服务原本在运行，重启以加载新版本"
+		"$INIT" restart >/dev/null 2>&1 || true
+	else
+		log "    服务未启动（如需启用：uci set xxwan.main.enabled=1 && uci commit xxwan && $INIT start）"
+	fi
+	return 0
+}
+
+do_install() {
+	local cur_force="$OPT_FORCE"
+	if installed && [ "$cur_force" != 1 ]; then
+		die "检测到已安装（如要重装请加 --force，如要升级请用 upgrade）"
+	fi
+	log "==> 安装 luci-app-xxwan（来源: ${OPT_FROM:-GitHub $REPO@$BRANCH}）"
+	stop_for_replace
+	acquire
+	install_files "$SRC_DIR" 0
+	post_install
+	log "安装完成。浏览器打开: http://<本机IP>/cgi-bin/luci/ → 网络 → XXWAN 多线策略"
+	log "提示：默认未启用（xxwan.main.enabled=0），请在「全局设置」页开启。"
+	return 0
+}
+
+do_upgrade() {
+	log "==> 升级 luci-app-xxwan"
+	if [ "$OPT_KEEP" = no ]; then
+		# --no-keep-config 是显式的破坏性选择，但仍需二次确认，避免手滑清掉配置
+		if ask_yn "不保留配置：将删除 $CONF，确定？" n; then
+			rm -f "$CONF" 2>/dev/null || true
+			log "    已清除本机配置"
+		else
+			die "已取消（配置未改动）。如确实要清配置，请加 --yes"
+		fi
+	fi
+	stop_for_replace
+	acquire
+	# 覆盖配置与否：--no-keep-config 时上面已删，install_files 会因文件不存在而写入默认值
+	install_files "$SRC_DIR" 0
+	post_install
+	new_default_hint
+	log "升级完成。"
+	return 0
+}
+
+# ============ 卸载 ============
+save_config() {
+	mkdir -p "$KEEP_DIR" || die "无法创建 $KEEP_DIR"
+	if [ -e "$CONF" ]; then
+		cp -a "$CONF" "$KEEP_DIR/xxwan" 2>/dev/null || true
+		log "    已留存 $CONF -> $KEEP_DIR/xxwan"
+	fi
+	return 0
+}
+
+restore_config() {
+	if [ -d "$KEEP_DIR" ] && [ -e "$KEEP_DIR/xxwan" ]; then
+		cp -a "$KEEP_DIR/xxwan" "$CONF" 2>/dev/null || true
+		log "    已还原 $CONF"
+	fi
+	return 0
+}
+
+stop_services() {
+	stop_for_replace
+	if [ -x "$INIT" ]; then
+		"$INIT" disable >/dev/null 2>&1 || true
+	fi
+	return 0
+}
+
+remove_residual() {
+	local f n=0
+	for f in $MANIFEST; do
+		if [ -e "/$f" ]; then
+			rm -f "/$f" 2>/dev/null || true
+			n=$((n + 1))
+		fi
+	done
+	rm -rf /usr/lib/lua/luci/model/cbi/xxwan 2>/dev/null || true
+	rm -f /var/log/xxwan.log /tmp/xxwan_state 2>/dev/null || true
+	if [ "$n" -gt 0 ]; then log "    删除文件 $n 个"; fi
+	return 0
+}
+
+do_uninstall() {
+	local pm
+	pm=$(detect_pm)
+	log "==> 卸载 luci-app-xxwan"
+
+	# 1) 停服务（必须在删文件之前，否则留下拉起不存在脚本的僵尸条目）
+	stop_services
+
+	# 2) 配置去留
+	if [ "$OPT_KEEP" = no ]; then
+		if ask_yn "不保留配置：将删除 $CONF，确定？" n; then
+			log "==> 不保留配置（--no-keep-config）"
+			rm -f "$CONF" 2>/dev/null || true
+		else
+			die "已取消（配置未改动）。如确实要清配置，请加 --yes"
+		fi
+	else
+		log "==> 保留配置到 $KEEP_DIR"
+		save_config
+	fi
+
+	# 3) 包管理器卸载（可能未登记，失败属正常）
+	if [ "$pm" = apk ]; then
+		apk del luci-app-xxwan >/dev/null 2>&1 || warn "apk del 未成功（可能未登记），继续按清单清理"
+	elif [ "$pm" = opkg ]; then
+		opkg remove luci-app-xxwan >/dev/null 2>&1 || warn "opkg remove 未成功（可能未登记），继续按清单清理"
+	fi
+
+	# 4) 本脚本自己也在清单里，会被删掉；先留一份到 /tmp，方便立刻重装
+	if [ -f "$0" ]; then
+		if cp -f "$0" /tmp/xxwan-install 2>/dev/null; then
+			chmod 755 /tmp/xxwan-install 2>/dev/null || true
+			log "    本脚本已留一份到 /tmp/xxwan-install（重启后失效）"
+		fi
+	fi
+
+	# 5) 按清单补扫残留
+	remove_residual
+
+	# 6) 拷回配置
+	if [ "$OPT_KEEP" != no ]; then
+		restore_config
+		log "    保留的配置在 $KEEP_DIR，确认无误后可自行删除该目录"
+	fi
+
+	# 7) 收尾
+	rm -f /tmp/luci-indexcache* 2>/dev/null || true
+	rm -rf /tmp/luci-modulecache 2>/dev/null || true
+	log "卸载完成。（菜单消失需 Ctrl+F5 强刷）"
+	log "如需重装：sh /tmp/xxwan-install install"
+	return 0
+}
+
+# ============ info ============
+do_info() {
+	local pm scan p m
+	pm=$(detect_pm)
+	scan=$(scan_files); p=${scan%% *}; m=${scan##* }
+	log "仓库:       https://github.com/$REPO"
+	log "分支:       $BRANCH"
+	log "包管理器:   $pm"
+	if installed; then log "安装状态:   已安装"; else log "安装状态:   未安装"; fi
+	log "落地文件:   $p 个存在 / $m 个缺失"
+	if [ -f "$CONF" ]; then log "配置文件:   $CONF 存在"; else log "配置文件:   无"; fi
+	if command -v uci >/dev/null 2>&1; then
+		log "引擎开关:   xxwan.main.enabled = $(uci -q get xxwan.main.enabled)"
+		log "pbr 开关:   pbr.config.enabled = $(uci -q get pbr.config.enabled)"
+	fi
+	check_deps || true
+	return 0
+}
+
+# ============ 入口 ============
+usage() {
+	# 从第 2 行打印到第一个 ★ 说明之前（不写死行号，改注释也不会错位）
+	sed -n '2,/^# ★ /p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+CMD="${1:-}"
+[ -n "$CMD" ] || { usage; exit 1; }
+shift || true
+
+for a in "$@"; do
+	case "$a" in
+		--keep-config)    OPT_KEEP=yes ;;
+		--no-keep-config) OPT_KEEP=no ;;
+		--force)          OPT_FORCE=1 ;;
+		--yes|-y)         OPT_YES=1 ;;
+		--from=*)         OPT_FROM=${a#--from=} ;;
+		--branch=*)       BRANCH=${a#--branch=} ;;
+		--mirror=*)       OPT_MIRROR=${a#--mirror=} ;;
+		-h|--help)        usage; exit 0 ;;
+		*)                die "未知参数: $a" ;;
+	esac
+done
+
+[ "$OPT_KEEP" = default ] && OPT_KEEP=yes
+
+WORK=$(mktemp -d /tmp/xxwan-inst.XXXXXX 2>/dev/null || echo "/tmp/xxwan-inst.$$")
+mkdir -p "$WORK"
+
+case "$CMD" in
+	install)   do_install ;;
+	upgrade)   do_upgrade ;;
+	uninstall) do_uninstall ;;
+	info)      do_info ;;
+	-h|--help|help) usage; exit 0 ;;
+	*)         usage; die "未知命令: $CMD" ;;
+esac

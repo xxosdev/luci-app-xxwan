@@ -1,0 +1,4 @@
+# luci-app-xxwan 临时文件
+*.tar
+*.tar.gz
+*.gz

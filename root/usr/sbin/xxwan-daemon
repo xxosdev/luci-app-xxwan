@@ -1,0 +1,389 @@
+#!/bin/sh
+CONF="xxwan"; TAG="XXWAN"
+LOG_FILE="/var/log/xxwan.log"
+touch $LOG_FILE
+
+log() {
+    logger -t "$TAG" "$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$LOG_FILE"
+    tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+}
+
+# 连接跟踪表清理模式读取（兼容旧版 flush_conntrack 开关）
+get_flush_mode() {
+    local mode=$(uci -q get ${CONF}.advanced.conntrack_flush)
+    if [ -z "$mode" ]; then
+        local old=$(uci -q get ${CONF}.advanced.flush_conntrack)
+        if [ "$old" = "1" ]; then mode="always"; else mode="never"; fi
+    fi
+    echo "$mode"
+}
+
+# 核心 Webhook 触发模块
+trigger_webhook() {
+    local event="$1"; local active_wan="$2"; local is_test="$3"
+    local method=$(uci -q get ${CONF}.advanced.webhook_method || echo "GET")
+    
+    local ev_time=$(date '+%Y-%m-%d %H:%M:%S')
+    local ev_time_url=$(echo "$ev_time" | sed 's/ /%20/g') # GET 专用 URL 编码
+    local ev_host=$(uci -q get system.@system[0].hostname || cat /proc/sys/kernel/hostname 2>/dev/null || echo "OpenWrt")
+    local ev_ip=$(ubus call network.interface."$active_wan" status 2>/dev/null | jsonfilter -e '@.ipv4-address[0].address')
+    [ -z "$ev_ip" ] && ev_ip="未知IP"
+
+    # URL 全局渲染
+    local url=$(uci -q get ${CONF}.advanced.webhook_url | \
+        sed "s#\$EVENT#$event#g" | \
+        sed "s#\$IFACE#$active_wan#g" | \
+        sed "s#\$TIME#$ev_time_url#g" | \
+        sed "s#\$HOSTNAME#$ev_host#g" | \
+        sed "s#\$IP#$ev_ip#g")
+    
+    [ -z "$url" ] && return 0
+    
+    local dev=$(ubus call network.interface."$active_wan" status 2>/dev/null | jsonfilter -e '@.l3_device')
+    [ -z "$dev" ] && dev="auto"
+
+    log "正在发送 Webhook 通知（$method）"
+    
+    local payload=""
+    if [ "$method" = "POST" ]; then
+        payload=$(uci -q get ${CONF}.advanced.webhook_payload | \
+            sed "s#\$EVENT#$event#g" | \
+            sed "s#\$IFACE#$active_wan#g" | \
+            sed "s#\$TIME#$ev_time#g" | \
+            sed "s#\$HOSTNAME#$ev_host#g" | \
+            sed "s#\$IP#$ev_ip#g")
+    fi
+
+    # 测试模式：记录全链路输出，不挂后台
+    if [ "$is_test" = "test" ]; then
+        log "---------------------------------"
+        log "Webhook 测试"
+        log "目标地址：$url"
+        [ "$method" = "POST" ] && log "请求内容：$payload"
+        log "等待服务器响应（最长 10 秒）…"
+        
+        local res=""
+        if [ "$method" = "POST" ]; then
+            if [ "$dev" = "auto" ]; then
+                res=$(curl -sS -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" 2>&1)
+            else
+                res=$(curl -sS --interface "$dev" -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" 2>&1)
+            fi
+        else
+            if [ "$dev" = "auto" ]; then
+                res=$(curl -sS -X GET -k -m 10 "$url" 2>&1)
+            else
+                res=$(curl -sS --interface "$dev" -X GET -k -m 10 "$url" 2>&1)
+            fi
+        fi
+        
+        log "服务器返回：$res"
+        log "---------------------------------"
+    else
+        # 生产模式：静默后台执行
+        if [ "$method" = "POST" ]; then
+            if [ "$dev" = "auto" ]; then
+                curl -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" >/dev/null 2>&1 &
+            else
+                curl --interface "$dev" -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" >/dev/null 2>&1 &
+            fi
+        else
+            if [ "$dev" = "auto" ]; then
+                curl -X GET -k -m 10 "$url" >/dev/null 2>&1 &
+            else
+                curl --interface "$dev" -X GET -k -m 10 "$url" >/dev/null 2>&1 &
+            fi
+        fi
+    fi
+}
+
+if [ "$1" = "test_webhook" ]; then
+    log "========== 用户手动触发 Webhook 测试 =========="
+    trigger_webhook "TEST_DOWN" "WAN_TEST" "test"
+    exit 0
+fi
+
+check_iface() {
+    local iface="$1"; local c_type="$2"; local c_tgt="$3"; local c_url="$4"; local c_code="$5"
+    local dev=$(ubus call network.interface."$iface" status 2>/dev/null | jsonfilter -e '@.l3_device')
+    [ -z "$dev" ] && return 1
+    if [ "$c_type" = "ping" ]; then
+        for ip in $c_tgt; do 
+            [ -z "$ip" ] && continue
+            if ping -c 1 -W 2 -I "$dev" "$ip" >/dev/null 2>&1; then return 0; fi
+        done
+    elif [ "$c_type" = "curl" ]; then
+        local code=$(curl --interface "$dev" -s -o /dev/null -w "%{http_code}" -m 3 "$c_url")
+        [ "$code" = "$c_code" ] && return 0
+    fi
+    return 1
+}
+
+sync_network_state() {
+    local event_msg="$1"; local event_type="$2"
+    log "更新路由策略：$event_msg"
+    local status_html=""
+    local best_auto_iface=""
+    local all_wans=""
+    
+    while read -r line; do
+        [ -z "$line" ] && continue
+        local i_iface=$(echo "$line" | awk '{print $1}')
+        all_wans="$all_wans $i_iface"
+        local i_tier=$(echo "$line" | awk '{print $2}' | cut -d':' -f2)
+        local i_state=$(echo "$line" | awk '{print $3}' | cut -d':' -f2)
+        if [ "$i_state" = "UP" ]; then
+            status_html="${status_html} <span style='display:inline-block; margin-right:15px;'><span style='display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--success); margin-right:5px;'></span><b style='color:var(--text);'>${i_iface}</b> <span style='color:var(--text-muted);'>(Tier ${i_tier} · 在线)</span></span>"
+            if [ -z "$best_auto_iface" ]; then
+                for t in 1 2 3; do
+                    best_auto_iface=$(cat /tmp/xxwan_state 2>/dev/null | grep "TIER:${t} STATUS:UP" | head -n 1 | awk '{print $1}')
+                    [ -n "$best_auto_iface" ] && break
+                done
+            fi
+        else
+            status_html="${status_html} <span style='display:inline-block; margin-right:15px;'><span style='display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--text-subtle); margin-right:5px;'></span><b style='color:var(--text-muted);'>${i_iface}</b> <span style='color:var(--text-subtle);'>(Tier ${i_tier} · 离线)</span></span>"
+        fi
+    done < /tmp/xxwan_state
+
+    local gmode=$(uci -q get ${CONF}.main.global_mode || echo "auto")
+    local best_iface=""
+    if [ "$gmode" = "auto" ]; then best_iface="$best_auto_iface"; else best_iface="${gmode#force_}"; fi
+
+    local log_best_iface="$best_iface"
+    [ -z "$log_best_iface" ] && log_best_iface="无（全部离线）"
+    log "当前出口：$log_best_iface"
+
+    ip route show | grep "metric 1" | grep "default" | while read -r line; do ip route del $line 2>/dev/null; done
+    if [ -n "$best_iface" ]; then
+        local alive_gw=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@.route[0].nexthop')
+        local alive_dev=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@.l3_device')
+        if [ -n "$alive_dev" ]; then
+            if [ -n "$alive_gw" ] && [ "$alive_gw" != "0.0.0.0" ]; then
+                ip route add default via "$alive_gw" dev "$alive_dev" metric 1 2>/dev/null
+            else
+                log "线路 $best_iface 无网关，改用直连设备路由"
+                ip route add default dev "$alive_dev" metric 1 2>/dev/null
+            fi
+        fi
+    fi
+
+    uci show pbr | grep -E "=policy" | cut -d'.' -f2 | cut -d'=' -f1 | grep "^xxwan_" | while read -r section; do uci delete pbr.${section}; done
+
+    uci -q get pbr.config >/dev/null || uci set pbr.config=pbr
+    local ipv6_en=$(uci -q get ${CONF}.main.ipv6_enabled); [ -z "$ipv6_en" ] && ipv6_en="0"
+    local strict_en=$(uci -q get ${CONF}.main.strict_enforcement); [ -z "$strict_en" ] && strict_en="1"
+    uci set pbr.config.ipv6_enabled="$ipv6_en"
+    uci set pbr.config.strict_enforcement="$strict_en"
+
+    local pbr_log_msg=""
+    if [ -n "$best_iface" ]; then
+        uci set pbr.config.uplink_interface="$best_iface"
+        pbr_log_msg="出口已切换至 $best_iface"
+    else
+        # 全部离线：清理残留的出口指向，避免状态与实际不符
+        uci -q delete pbr.config.uplink_interface
+        pbr_log_msg="无可用线路，全部离线"
+    fi
+    
+    if [ -n "$all_wans" ]; then
+        uci set pbr.config.supported_interface="$all_wans"
+    fi
+
+    local RULES=$(uci -q show ${CONF} | grep "=rule" | cut -d'.' -f2 | cut -d'=' -f1)
+    local rule_idx=1
+    for r_sec in $RULES; do
+        local r_name=$(uci -q get ${CONF}.${r_sec}.name)
+        local enabled=$(uci -q get ${CONF}.${r_sec}.enabled); [ -z "$enabled" ] && enabled="1"
+        local tgt_iface=$(uci -q get ${CONF}.${r_sec}.target_iface)
+        local strict_bind=$(uci -q get ${CONF}.${r_sec}.strict_bind)
+        
+        local is_up=$(cat /tmp/xxwan_state 2>/dev/null | grep "^${tgt_iface} " | grep "STATUS:UP")
+        local final_iface="$tgt_iface"
+        
+        if [ -z "$is_up" ]; then
+            if [ "$strict_bind" = "1" ]; then final_iface="$tgt_iface" 
+            else 
+                final_iface="$best_auto_iface"
+                [ -z "$final_iface" ] && final_iface="$tgt_iface"
+            fi
+        fi
+        
+        if [ -n "$final_iface" ] && [ -n "$r_name" ]; then
+            local new_sec="xxwan_rule_${rule_idx}"
+            uci set pbr.${new_sec}="policy"; uci set pbr.${new_sec}.name="[XXWAN] ${r_name}"
+            uci set pbr.${new_sec}.interface="${final_iface}"; uci set pbr.${new_sec}.enabled="${enabled}"
+            local chain=$(uci -q get ${CONF}.${r_sec}.chain); [ -n "$chain" ] && uci set pbr.${new_sec}.chain="$chain"
+            local src_val=$(echo "$(uci -q get ${CONF}.${r_sec}.src_ip) $(uci -q get ${CONF}.${r_sec}.src_mac)" | xargs); [ -n "$src_val" ] && uci set pbr.${new_sec}.src_addr="$src_val"
+            local s_port=$(uci -q get ${CONF}.${r_sec}.src_port); [ -n "$s_port" ] && uci set pbr.${new_sec}.src_port="$s_port"
+            local dest_val=$(echo "$(uci -q get ${CONF}.${r_sec}.dest_ip) $(uci -q get ${CONF}.${r_sec}.dest_domain)" | xargs); [ -n "$dest_val" ] && uci set pbr.${new_sec}.dest_addr="$dest_val"
+            local d_port=$(uci -q get ${CONF}.${r_sec}.dest_port); [ -n "$d_port" ] && uci set pbr.${new_sec}.dest_port="$d_port"
+            local proto=$(uci -q get ${CONF}.${r_sec}.proto); [ -n "$proto" ] && [ "$proto" != "all" ] && uci set pbr.${new_sec}.proto="$proto"
+            rule_idx=$((rule_idx + 1))
+        fi
+    done
+    
+    # pbr.config.enabled 为 0 时 restart 不会真正启动，分流规则不生效
+    local pbr_en=$(uci -q get pbr.config.enabled)
+    [ "$pbr_en" != "1" ] && log "PBR 功能开关未启用（pbr.config.enabled=0），分流规则不会生效，请在「全局设置」页启用 PBR"
+
+    uci commit pbr
+    /etc/init.d/pbr restart >/dev/null 2>&1
+    log "PBR 策略已更新（$pbr_log_msg）"
+
+    # 连接跟踪表清理：按配置的时机执行
+    local flush_mode=$(get_flush_mode)
+    local do_flush=0
+    case "$flush_mode" in
+        always)  do_flush=1 ;;
+        restore) [ "$event_type" = "up" ] && do_flush=1 ;;
+        *)       do_flush=0 ;;
+    esac
+    if [ "$do_flush" -eq 1 ]; then
+        log "清除连接跟踪表（会中断当前所有连接）"
+        conntrack -F >/dev/null 2>&1
+    fi
+
+    local svcs=$(uci -q get ${CONF}.advanced.reload_services)
+    for svc in $svcs; do [ -n "$svc" ] && log "正在重启关联服务：$svc" && /etc/init.d/"$svc" restart >/dev/null 2>&1; done
+
+    [ -z "$status_html" ] && status_html="<span style='color:var(--text-muted);'>全部离线或未配置接口</span>"
+    if [ "$gmode" != "auto" ]; then status_html="${status_html} <br/><span style='color:var(--info); font-size:12px; margin-top:5px; display:block;'>手动锁定出口：<b>${gmode#force_}</b></span>"; fi
+    uci set ${CONF}.status.active_nodes="${status_html}"
+    uci set ${CONF}.status.last_event="$(date '+%H:%M:%S') - $event_msg"
+    uci commit ${CONF}
+}
+
+rm -f /tmp/xxwan_state
+FIRST_RUN=1
+
+# 首轮快速探测：启动瞬间对每条线路连续探测若干次，一次性定出真实状态。
+# 否则重启后状态为空、每条线默认算在线，一条已断的 Tier 1 会被当成出口，
+# 要等满 fail_threshold 次失败（约十几秒）才切走 —— 期间断网。
+FAIL_THRESH=$(uci -q get ${CONF}.main.fail_threshold); [ -z "$FAIL_THRESH" ] && FAIL_THRESH=3
+case "$FAIL_THRESH" in ''|*[!0-9]*) FAIL_THRESH=3 ;; esac
+[ "$FAIL_THRESH" -lt 1 ] && FAIL_THRESH=1
+IFACES=$(uci -q show ${CONF} | grep "=interface" | cut -d'.' -f2 | cut -d'=' -f1)
+touch /tmp/xxwan_state
+for if_sec in $IFACES; do
+    ifname=$(uci -q get ${CONF}.${if_sec}.ifname)
+    tier=$(uci -q get ${CONF}.${if_sec}.tier)
+    c_type=$(uci -q get ${CONF}.${if_sec}.check_type)
+    c_tgt=$(uci -q get ${CONF}.${if_sec}.check_targets)
+    c_url=$(uci -q get ${CONF}.${if_sec}.curl_url)
+    c_code=$(uci -q get ${CONF}.${if_sec}.curl_code)
+    [ -z "$ifname" ] && continue
+    ok_cnt=0
+    i=1
+    while [ "$i" -le "$FAIL_THRESH" ]; do
+        if check_iface "$ifname" "$c_type" "$c_tgt" "$c_url" "$c_code"; then
+            ok_cnt=$((ok_cnt + 1))
+        fi
+        i=$((i + 1))
+        [ "$i" -le "$FAIL_THRESH" ] && sleep 1
+    done
+    # 探测成功过一次即判定在线：误判离线会触发切换，代价大于误判在线
+    if [ "$ok_cnt" -gt 0 ]; then
+        echo "${ifname} TIER:${tier} STATUS:UP 0 ${ok_cnt}" >> /tmp/xxwan_state
+    else
+        echo "${ifname} TIER:${tier} STATUS:DOWN ${FAIL_THRESH} 0" >> /tmp/xxwan_state
+    fi
+done
+log "首轮快速探测完成（每条线路探测 $FAIL_THRESH 次）"
+
+while true; do
+    ENABLE=$(uci -q get ${CONF}.main.enabled)
+    [ "$ENABLE" != "1" ] && { sleep 5; continue; }
+
+    INTERVAL=$(uci -q get ${CONF}.main.check_interval); [ -z "$INTERVAL" ] && INTERVAL=5
+    # 填 0 会让 sleep 0 变成忙等、吃满 CPU；非数字会让 sleep 报错刷屏
+    case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+    [ "$INTERVAL" -lt 1 ] && INTERVAL=1
+    FAIL_THRESH=$(uci -q get ${CONF}.main.fail_threshold); [ -z "$FAIL_THRESH" ] && FAIL_THRESH=3
+    case "$FAIL_THRESH" in ''|*[!0-9]*) FAIL_THRESH=3 ;; esac
+    [ "$FAIL_THRESH" -lt 1 ] && FAIL_THRESH=1
+    REST_THRESH=$(uci -q get ${CONF}.main.restore_threshold); [ -z "$REST_THRESH" ] && REST_THRESH=3
+    case "$REST_THRESH" in ''|*[!0-9]*) REST_THRESH=3 ;; esac
+    [ "$REST_THRESH" -lt 1 ] && REST_THRESH=1
+
+    STATE_CHANGED=0
+    LAST_EVT="init"
+    IFACES=$(uci -q show ${CONF} | grep "=interface" | cut -d'.' -f2 | cut -d'=' -f1)
+    
+    touch /tmp/xxwan_state_new
+
+    for if_sec in $IFACES; do
+        ifname=$(uci -q get ${CONF}.${if_sec}.ifname)
+        tier=$(uci -q get ${CONF}.${if_sec}.tier)
+        c_type=$(uci -q get ${CONF}.${if_sec}.check_type)
+        c_tgt=$(uci -q get ${CONF}.${if_sec}.check_targets)
+        c_url=$(uci -q get ${CONF}.${if_sec}.curl_url)
+        c_code=$(uci -q get ${CONF}.${if_sec}.curl_code)
+
+        old_line=$(grep "^${ifname} " /tmp/xxwan_state 2>/dev/null)
+        if [ -z "$old_line" ]; then
+            old_status="STATUS:UP"; fail_cnt=0; rest_cnt=0
+        else
+            old_status=$(echo "$old_line" | awk '{print $3}')
+            fail_cnt=$(echo "$old_line" | awk '{print $4}')
+            rest_cnt=$(echo "$old_line" | awk '{print $5}')
+        fi
+
+        if check_iface "$ifname" "$c_type" "$c_tgt" "$c_url" "$c_code"; then
+            fail_cnt=0
+            rest_cnt=$((rest_cnt + 1))
+            if [ "$old_status" = "STATUS:DOWN" ]; then
+                if [ "$rest_cnt" -ge "$REST_THRESH" ]; then
+                    new_status="STATUS:UP"
+                    log "线路 $ifname 连续 $REST_THRESH 次探测成功，已恢复在线"
+                    trigger_webhook "UP" "$ifname" ""
+                    h_up=$(uci -q get ${CONF}.advanced.hook_up)
+                    if [ -n "$h_up" ]; then
+                        log "执行恢复时自定义脚本"
+                        export XXWAN_EVENT="UP"; export XXWAN_IFACE="$ifname"
+                        eval "$h_up"
+                    fi
+                    STATE_CHANGED=1
+                    LAST_EVT="up"
+                else
+                    new_status="STATUS:DOWN"
+                    log "线路 $ifname 探测成功（$rest_cnt/$REST_THRESH），待确认恢复…"
+                fi
+            else
+                new_status="STATUS:UP"
+            fi
+        else
+            rest_cnt=0
+            fail_cnt=$((fail_cnt + 1))
+            if [ "$old_status" = "STATUS:UP" ]; then
+                if [ "$fail_cnt" -ge "$FAIL_THRESH" ]; then
+                    new_status="STATUS:DOWN"
+                    log "线路 $ifname 连续 $FAIL_THRESH 次探测失败，判定离线"
+                    trigger_webhook "DOWN" "$ifname" ""
+                    h_down=$(uci -q get ${CONF}.advanced.hook_down)
+                    if [ -n "$h_down" ]; then
+                        log "执行离线时自定义脚本"
+                        export XXWAN_EVENT="DOWN"; export XXWAN_IFACE="$ifname"
+                        eval "$h_down"
+                    fi
+                    STATE_CHANGED=1
+                    LAST_EVT="down"
+                else
+                    new_status="STATUS:UP"
+                    log "线路 $ifname 探测失败（$fail_cnt/$FAIL_THRESH），待确认离线…"
+                fi
+            else
+                new_status="STATUS:DOWN"
+            fi
+        fi
+        echo "${ifname} TIER:${tier} ${new_status} ${fail_cnt} ${rest_cnt}" >> /tmp/xxwan_state_new
+    done
+
+    mv /tmp/xxwan_state_new /tmp/xxwan_state
+
+    if [ "$STATE_CHANGED" -eq 1 ] || [ "$FIRST_RUN" -eq 1 ]; then
+        sync_network_state "线路状态变化或引擎重启" "$LAST_EVT"
+        FIRST_RUN=0
+    fi
+    sleep "$INTERVAL"
+done
