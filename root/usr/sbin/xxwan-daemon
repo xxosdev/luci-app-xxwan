@@ -225,7 +225,7 @@ sync_network_state() {
     
     # pbr.config.enabled 为 0 时 restart 不会真正启动，分流规则不生效
     local pbr_en=$(uci -q get pbr.config.enabled)
-    [ "$pbr_en" != "1" ] && log "PBR 功能开关未启用（pbr.config.enabled=0），分流规则不会生效，请在「全局设置」页启用 PBR"
+    [ "$pbr_en" != "1" ] && log "PBR 功能开关未启用（pbr.config.enabled=0），分流规则不会生效，请在「全局设置」页点「启用分流」"
 
     uci commit pbr
     /etc/init.d/pbr restart >/dev/null 2>&1

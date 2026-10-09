@@ -35,7 +35,7 @@ OpenWrt LuCI 的多线（多 WAN）策略路由插件，以 **pbr** 为底层，
 +luci-base
 ```
 
-> ⚠ **pbr 有两级开关**：`/etc/init.d/pbr enable`（开机自启）与 `pbr.config.enabled`（功能开关）。只 enable 不置 1 的话分流规则不会生效。本插件在「全局设置」页的「PBR 操作」一行提供「启用并重启 PBR」与「停止 PBR」两个按钮，一次搞定开关 + 自启 + 服务启停。
+> ⚠ **pbr 有两级开关**：`/etc/init.d/pbr enable`（开机自启）与 `pbr.config.enabled`（功能开关）。只 enable 不置 1 的话分流规则不会生效。本插件在「全局设置」页的「分流控制」一行提供「启用分流」与「停用分流」两个按钮，一次搞定开关 + 自启 + 服务启停。
 
 ---
 
@@ -128,7 +128,7 @@ xxwan-install info                    # 探测本机环境与安装状态
 
 ## 使用步骤
 
-1. **确认依赖就位**：安装 `pbr`、`curl`、`conntrack`，并在「全局设置」页点一次「启用并重启 PBR」（它会 `uci set pbr.config.enabled='1'` + commit + enable + restart）。旁边的「停止 PBR」则相反：`enabled='0'` + commit + `pbr disable` + `pbr stop`，用于彻底关闭（之后 XXWAN 的分流与故障切换都会失效）。
+1. **确认依赖就位**：安装 `pbr`、`curl`、`conntrack`，并在「全局设置」页点一次「启用分流」（它会 `uci set pbr.config.enabled='1'` + commit + enable + restart）。旁边的「停用分流」则相反：`enabled='0'` + commit + `pbr disable` + `pbr stop`，用于彻底关闭（之后 XXWAN 的分流与故障切换都会失效）。
 2. **添加线路**（「线路接口」页）：选择网络接口、指定优先级（Tier 1/2/3）、选探测方式并填探测目标。默认配置已预置 `wan`（Tier 1）与 `wan2`（Tier 2）两条，按实际接口名调整即可。
 3. **（可选）配置分流规则**（「分流规则」页）：为指定设备或目标配置固定出口；不做规则则所有流量走全局出口策略。
 4. **（可选）配置切换动作与通知**（「动作与通知」页）：连接跟踪清理模式、切换后要重启的服务、Hook 脚本、Webhook。

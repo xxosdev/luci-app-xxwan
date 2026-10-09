@@ -304,7 +304,7 @@ post_install() {
 	if command -v uci >/dev/null 2>&1; then
 		if [ "$(uci -q get pbr.config.enabled)" != "1" ]; then
 			warn "pbr 的功能开关当前为关闭状态（pbr.config.enabled=0），xxwan 的分流规则不会生效。"
-			warn "  可在 LuCI 的「网络 → XXWAN 多线策略 → 全局设置」页点击「启用并重启 PBR」。"
+			warn "  可在 LuCI 的「网络 → XXWAN 多线策略 → 全局设置」页点击「启用分流」。"
 		fi
 	fi
 	# 清 LuCI 缓存，菜单才会刷新

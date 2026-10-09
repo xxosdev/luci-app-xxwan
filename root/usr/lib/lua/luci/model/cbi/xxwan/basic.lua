@@ -1,6 +1,6 @@
 local uci = require("luci.model.uci").cursor()
 local sys = require("luci.sys")
-local m = Map("xxwan", translate("XXWAN 多线策略路由"), translate("管理多线负载均衡与故障切换。"))
+local m = Map("xxwan", translate("XXWAN 多线策略"), translate("管理多线负载均衡与故障切换。"))
 
 -- 引擎开关与出口选择
 local s_top = m:section(NamedSection, "main", "global", translate("引擎与出口"))
@@ -69,7 +69,9 @@ cur.template = "cbi/dvalue"
 function cur.cfgvalue(self, section) return uci:get("xxwan", "status", "active_nodes") or "<span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>等待探测…</span>" end
 cur.rawhtml = true
 
-local pbr_stat = s_stat:option(DummyValue, "pbr_status", translate("PBR 服务状态"))
+-- ★ 界面文案统一用「分流」，不再暴露底层包名 pbr：用户关心的是分流有没有生效，
+--   而不是底层进程叫什么。pbr 只保留在「未安装」提示与配置项引用里（见下方 cfgvalue）。
+local pbr_stat = s_stat:option(DummyValue, "pbr_status", translate("分流服务状态"))
 pbr_stat.template = "cbi/dvalue"
 function pbr_stat.cfgvalue(self, section)
     if sys.call("test -f /etc/init.d/pbr") ~= 0 then return "<span style='color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;'>[未安装]</span> 请先在软件包中安装 pbr" end
@@ -85,15 +87,20 @@ function pbr_stat.cfgvalue(self, section)
 end
 pbr_stat.rawhtml = true
 
--- PBR 操作：同样用 svc_buttons.htm 把「启用」和「停止」放在一行
---   「启用并重启 PBR」= 功能开关置 1 + 配置开机自启 + restart
---   「停止 PBR」      = 功能开关置 0 + 取消开机自启 + stop（彻底关闭，重启设备也不会自己起来）
-local pbr_btn = s_stat:option(Button, "_pbr_btn", translate("PBR 操作"),
-    translate("「启用并重启 PBR」会把 pbr.config.enabled 设为 1、配置开机自启并重启服务；「停止 PBR」则设为 0、取消开机自启并停止服务（之后 XXWAN 的分流与故障切换都会失效）。"))
+-- 分流控制：同样用 svc_buttons.htm 把「启用」和「停用」放在一行
+--   「启用分流」= 底层 pbr 功能开关置 1 + 配置开机自启 + restart
+--   「停用分流」= 功能开关置 0 + 取消开机自启 + stop（彻底关闭，重启设备也不会自己起来）
+-- ★ 按钮名只写用户意图（启用/停用），不写实现步骤（原来的「启用并重启」把 enabled=1 +
+--   enable + restart 三件事塞进了名字，读起来绕口）；实现细节交给下面那行灰色说明。
+-- ★ 用「启用/停用」而不是「启动/停止」：这两件事是持久的（重启设备也不会自己回来），
+--   与上面「服务控制」的启动/停止（临时，重启仍自启）刻意用不同的词区分。
+-- ★ 界面统一说「分流」，但灰色说明里首次出现时点明「底层 pbr」——用户去软件包搜索有据可依。
+local pbr_btn = s_stat:option(Button, "_pbr_btn", translate("分流控制"),
+    translate("分流由底层 pbr 提供：「启用分流」会把 pbr.config.enabled 设为 1、配置开机自启并重启服务；「停用分流」则设为 0、取消开机自启并停止服务（之后 XXWAN 的分流与故障切换都会失效）。"))
 pbr_btn.template = "xxwan/svc_buttons"
-pbr_btn.inputtitle = translate("启用并重启 PBR")
+pbr_btn.inputtitle = translate("启用分流")
 pbr_btn.inputstyle = "apply"
-pbr_btn.inputtitle2 = translate("停止 PBR")
+pbr_btn.inputtitle2 = translate("停用分流")
 pbr_btn.inputstyle2 = "remove"
 function pbr_btn.write(self, section, value)
     if value == "stop" then
