@@ -1,12 +1,263 @@
 #!/bin/sh
 CONF="xxwan"; TAG="XXWAN"
 LOG_FILE="/var/log/xxwan.log"
+WEBHOOK_LAST="/tmp/xxwan_webhook_last"
+EGRESS_FILE="/tmp/xxwan_egress"
 touch $LOG_FILE
 
+# ★ logger 前面必须加 `--`：分隔线 "-----..." 以 - 开头，busybox logger 会把它
+#   当成选项解析，每次都在 stderr 吐一遍 usage 报错（真机实测）。`--` 终止选项解析。
 log() {
-    logger -t "$TAG" "$1"
+    logger -t "$TAG" -- "$1"
     echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$LOG_FILE"
     tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+}
+
+# 只追加、不轮转：后台子进程专用。
+# ★ 不能让后台任务也调 log()：两个进程同时 tail+mv 同一个 ${LOG_FILE}.tmp 会互相覆盖，
+#   日志可能被截断或写乱。后台任务统一用这个。
+log_append() {
+    logger -t "$TAG" -- "$1"
+    printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+}
+
+# ── 通用小工具 ────────────────────────────────────────────────────────
+
+# 数值型 UCI 读取 + 钳制：$1=路径 $2=默认 $3=下限 $4=上限
+uci_num() {
+    local _v=$(uci -q get "$1")
+    case "$_v" in ''|*[!0-9]*) _v="$2" ;; esac
+    [ -n "$3" ] && [ "$_v" -lt "$3" ] && _v="$3"
+    [ -n "$4" ] && [ "$_v" -gt "$4" ] && _v="$4"
+    echo "$_v"
+}
+
+# URL 编码：RFC3986 未保留字符原样，其余按字节转 %XX。
+# 真机验证过：空格→%20、冒号→%3A、中文→UTF-8 逐字节编码、&/? 都正确。
+urlenc() {
+    local _s="$1" _out="" _c
+    while [ -n "$_s" ]; do
+        _c="${_s%"${_s#?}"}"
+        _s="${_s#?}"
+        case "$_c" in
+            [a-zA-Z0-9.~_-]) _out="$_out$_c" ;;
+            *) _out="$_out$(printf '%%%02X' "'$_c" 2>/dev/null)" ;;
+        esac
+    done
+    printf '%s' "$_out"
+}
+
+# sed 替换值的转义：本文件统一用 | 作分隔符，而值里可能带 & | \ （真机验证过）
+sed_esc() { printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }
+
+# ── 带超时执行 Hook 脚本 ──────────────────────────────────────────────
+# ★★ 两个必须处理的坑，都是真机实测出来的：
+#
+# ① **不是所有固件都有 `timeout` 命令**。ImmortalWRT 6.12 那两台就没有
+#    （busybox 没编这个 applet），而 PonWrt 6.18 有。原代码直接调 `timeout`，
+#    在老设备上得到 rc=127 + "sh: timeout: not found" ——
+#    **Hook 脚本根本不会被执行**，而日志只写「rc=127」，完全看不出原因。
+#    → 两级探测：系统 timeout / 自实现。
+#
+# ② **输出不能直接写成 $(timeout ...)**。命令替换走的是**管道**，而超时
+#    （尤其自实现那一级）只杀得掉直接子进程；脚本里 `sleep 30`、没加 -m 的 curl
+#    这类**孙进程**会继续持有管道写端，$( ) 就一路等下去，超时形同虚设。
+#    实测 `run_hook_script /tmp/out 2 "sh -c 'echo x; sleep 8'"`：走管道 8s、走文件 2s。
+#    → 先把输出重定向到文件，超时返回后再回读。
+#
+# 两条路径**超时都返回 124**，所以调用方的判断逻辑无需区分。
+# 两级探测：系统自带 timeout → 自实现。
+# ★ 特意**不**用 `busybox timeout`：真机实测它超时返回的是 143（128+SIGTERM）
+#   而不是 124，还会往 stderr 打一行 "Terminated" 污染捕获的输出；而自实现那级
+#   已验证行为正确（返回 124、耗时真的被限住），所以即使有 busybox timeout
+#   也直接走自实现，避免三套语义不一致。
+XXWAN_TO_MODE=""
+_to_probe() {
+    [ -n "$XXWAN_TO_MODE" ] && return
+    if command -v timeout >/dev/null 2>&1; then
+        XXWAN_TO_MODE="cmd"
+    else
+        XXWAN_TO_MODE="builtin"
+    fi
+}
+
+# 用法：run_hook_script <输出文件> <超时秒> <脚本>
+#   脚本输出打到 stdout（供调用方 $( ) 接住），返回码 = 脚本返回码（超时 124）。
+#   输出文件由调用方命名 —— 调用方用 `$$.$_dir.$_iface` 即可保证唯一
+#   （同一轮里一条线路不可能同时 up 和 down）。
+run_hook_script() {
+    local _of="$1" _t="$2" _s="$3" _rc=0 _p _k _mk
+    _to_probe
+    : > "$_of"
+    case "$XXWAN_TO_MODE" in
+        cmd)
+            timeout "$_t" sh -c "$_s" > "$_of" 2>&1; _rc=$?
+            ;;
+        *)
+            # 自实现。★ 只杀直接子进程 —— 与原版 timeout 行为一致（都不杀整个进程组）；
+            # 孙进程可能残留，但它们持有的是**文件** fd，不会拖住调用方。
+            # ★ 用标记文件区分「超时被杀」与「脚本自己退出」：wait 的返回码分不出二者
+            #   （脚本自杀同样是 128+n）。标记名用子进程 pid，天然唯一。
+            sh -c "$_s" > "$_of" 2>&1 &
+            _p=$!
+            _mk="/tmp/.xxwan_to.$_p"
+            rm -f "$_mk"
+            ( sleep "$_t"; kill -TERM "$_p" 2>/dev/null && : > "$_mk" ) &
+            _k=$!
+            wait "$_p" 2>/dev/null
+            _rc=$?
+            kill -TERM "$_k" 2>/dev/null
+            wait "$_k" 2>/dev/null
+            [ -f "$_mk" ] && { rm -f "$_mk"; _rc=124; }
+            ;;
+    esac
+    cat "$_of" 2>/dev/null
+    rm -f "$_of"
+    return "$_rc"
+}
+
+# ★ 键名带 `-` 时**不能用点号写法**：本固件的 jsonfilter 会把 `@.ipv4-address` 里的
+#   `-` 当成转义序列开头，直接报 "Syntax error: Invalid escape sequence"（rc=1、无输出）。
+#   实测：`@.x-y` 报错、`@.l3_device`（下划线）正常、`@["x-y"]`（方括号）正常。
+#   所以凡带连字符的键一律用 @["key"] 写法 —— 否则 iface_ip 永远返回空，
+#   连带 $WAN_IP/$IP 永远是「未知IP」、「仅故障线路」清表永远找不到要删的地址。
+iface_ip()  { ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0]["address"]' 2>/dev/null; }
+iface_dev() { ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@["l3_device"]' 2>/dev/null; }
+# 只接受「仅由十六进制数字、点、冒号组成」的值 —— 即合法的 IPv4 / IPv6 字面量。
+# 返回 0 = 像 IP；1 = 不像。
+# ★ 为什么必须校验：填错查询地址时（比如返回一整个 HTML 页），整页内容会被塞进
+#   通知 URL，真机实测直接把 URL 撑坏、curl 报 "URL rejected"（rc=3）。
+#   校验后失败模式变成「忽略并回退」，可控得多。
+looks_like_ip() {
+    case "$1" in
+        ''|*[!0-9a-fA-F:.]*) return 1 ;;
+    esac
+    return 0
+}
+
+# 该线路对应的 IPv6 接口名。
+#
+# ★★ 为什么需要这一步（真机实测踩到）：
+#   OpenWrt 的标准做法是 IPv6 挂在**独立接口**上，PPPoE 尤其如此：
+#       config interface 'wan'   → option proto 'pppoe'
+#       config interface 'wan6'  → option proto 'dhcpv6'   option device '@wan'
+#       config wan.ipv6 '0'      ← 主接口显式关掉 v6
+#   于是 xxwan 配的 ifname=wan 在 ubus 里**根本没有 v6 地址**：
+#       network.interface.wan  → ipv6-address 空
+#       network.interface.wan6 → ipv6-address 2408:824c:4e00:...  ✓
+#   三台真机（单宽带 / 双宽带 PPPoE / 光猫拨号）都是这个形态。
+#
+# 真机上见过的三种写法（都要能命中）：
+#   A  option device '@wan'      —— 用户两台设备的形态（最标准）
+#   B  option device 'pon0'      —— 与 wan 同一个物理设备，不带 @（PonWrt 就是这种）
+#   C  option ifname '@wan'      —— 旧版 LuCI 默认，接口名常叫 wan_6
+#
+# 查找顺序：① 配置里 device/ifname = '@<ifname>' 的接口（与接口名无关，最可靠）
+#           ② 命名约定 <ifname>6 / <ifname>_6
+#           ③ 兜底返回原名（调用方拿到空值，不会凭空造出不存在的接口名）
+iface_v6_name() {
+    local _n="$1" _s _c
+    _s=$(uci -q show network 2>/dev/null \
+         | grep -E "^network\.[A-Za-z0-9_-]+\.(device|ifname)='@${_n}'\$" \
+         | head -n 1 | cut -d. -f2)
+    if [ -n "$_s" ]; then echo "$_s"; return; fi
+    for _c in "${_n}6" "${_n}_6"; do
+        if ubus call network.interface."$_c" status >/dev/null 2>&1; then
+            echo "$_c"; return
+        fi
+    done
+    echo "$_n"
+}
+
+# 该线路 WAN 口的 IPv6 地址：取 ipv6-address 里**第一个非 link-local** 的地址。
+# ★ 为什么要 grep 掉 fe80：ubus 会把 link-local 一起列出来，而它对本机以外毫无意义。
+# ★ 注意 $WAN_IPV6 是「这条线路自己拿到的地址」，和 $PUBLIC_IPV6（查询所得的公网出口）
+#   在真机上**通常不是同一个**：实测单宽设备 WAN 口是 2408:824c:802:2add:...，
+#   而路由器实际对外用的是委派前缀里的 br-lan 地址 2408:824c:832:420:...。
+#
+# 两级查找：
+#   ① 先用 iface_v6_name 定位接口（覆盖 A/B/C 三种形态）
+#   ② 该接口没有地址时，退而在「所有接口」里找 l3_device 与该线路相同、
+#      且带非 fe80 地址的那个 —— 覆盖「v6 接口被起了怪名字、命名约定不成立」
+#   两级都拿不到就返回空，调用方回退成「未知IPv6」。
+iface_ip6() {
+    local _n="$1" _i _a _st _dev _x
+    _i=$(iface_v6_name "$_n")
+    _a=$(ubus call network.interface."$_i" status 2>/dev/null \
+         | jsonfilter -e '@["ipv6-address"][*]["address"]' 2>/dev/null \
+         | grep -v '^fe80' | head -n 1)
+    [ -n "$_a" ] && { printf '%s' "$_a"; return; }
+
+    _dev=$(iface_dev "$_n")
+    [ -z "$_dev" ] && return
+    for _x in $(ubus list 'network.interface.*' 2>/dev/null | sed 's/^network\.interface\.//'); do
+        [ "$_x" = "$_i" ] && continue
+        _st=$(ubus call network.interface."$_x" status 2>/dev/null)
+        [ -z "$_st" ] && continue
+        _a=$(printf '%s' "$_st" | jsonfilter -e '@["ipv6-address"][*]["address"]' 2>/dev/null \
+             | grep -v '^fe80' | head -n 1)
+        [ -z "$_a" ] && continue
+        [ "$(printf '%s' "$_st" | jsonfilter -e '@["l3_device"]' 2>/dev/null)" = "$_dev" ] \
+            && { printf '%s' "$_a"; return; }
+    done
+}
+
+# 该线路拿到的 **IPv6 委派前缀（PD）** —— 运营商下发给 LAN 的整段地址，
+# 形如 `2408:824c:832:420::/60`（真机实测：单宽设备 PD 是 ...832:420::/60，
+# 而 wan6 接口自己的地址是 ...802:2add:...，**两者不在同一前缀段**）。
+#
+# ★ 为什么要单独有这个变量：$WAN_IPV6 是「WAN 口那条 /64 上的地址」，
+#   $PUBLIC_IPV6 是「路由器实际对外用的地址（通常落在 PD 里）」，
+#   而本变量给的是**整段网段**。三者关系（单宽带实测）：
+#       $WAN_IPV6     2408:824c:802:2add:…   ← WAN 侧 /64 地址
+#       $WAN_PREFIX6  2408:824c:832:420::/60 ← 运营商委派的 PD（本变量）
+#       $PUBLIC_IPV6  2408:824c:832:420:…    ← 落在 PD 里面
+#   双宽带时每条线**各有两个段**：WAN 侧 /64 + PD /60，互不相同。
+#
+# ★ 取法与 iface_ip6 同构（先按名字，再按 l3_device 兜底），区别只在键：
+#   PD 在 ubus status 的 ipv6-prefix[] 里，字段是 address + mask（不是 ipv6-address）。
+#   注意 `[0]` 取第一个 —— 一台设备可能同时持有多个 PD（如 lan 的 prefix-assignment
+#   里就列了 3 个），但对「这条线路」而言第一个就是它自己的委派段。
+#   空数组 / 无该键时 jsonfilter 返回 rc=1 且无输出 → 干净地判空。
+#   掩码缺失属异常，用 `/?` 如实暴露而不是猜一个 64。
+iface_prefix6() {
+    local _n="$1" _i _st _a _m _dev _x
+    _i=$(iface_v6_name "$_n")
+    _st=$(ubus call network.interface."$_i" status 2>/dev/null)
+    _a=$(printf '%s' "$_st" | jsonfilter -e '@["ipv6-prefix"][0]["address"]' 2>/dev/null)
+    if [ -n "$_a" ]; then
+        _m=$(printf '%s' "$_st" | jsonfilter -e '@["ipv6-prefix"][0]["mask"]' 2>/dev/null)
+        printf '%s/%s' "$_a" "${_m:-?}"
+        return
+    fi
+
+    _dev=$(iface_dev "$_n")
+    [ -z "$_dev" ] && return
+    for _x in $(ubus list 'network.interface.*' 2>/dev/null | sed 's/^network\.interface\.//'); do
+        [ "$_x" = "$_i" ] && continue
+        _st=$(ubus call network.interface."$_x" status 2>/dev/null)
+        [ -z "$_st" ] && continue
+        _a=$(printf '%s' "$_st" | jsonfilter -e '@["ipv6-prefix"][0]["address"]' 2>/dev/null)
+        [ -z "$_a" ] && continue
+        [ "$(printf '%s' "$_st" | jsonfilter -e '@["l3_device"]' 2>/dev/null)" = "$_dev" ] || continue
+        _m=$(printf '%s' "$_st" | jsonfilter -e '@["ipv6-prefix"][0]["mask"]' 2>/dev/null)
+        printf '%s/%s' "$_a" "${_m:-?}"
+        return
+    done
+}
+iface_tier() {
+    local _s=$(uci -q show ${CONF} 2>/dev/null | grep "=interface" | cut -d. -f2 | cut -d= -f1 | while read -r _sec; do
+        [ "$(uci -q get ${CONF}.${_sec}.ifname)" = "$1" ] && { uci -q get ${CONF}.${_sec}.tier; break; }
+    done)
+    [ -z "$_s" ] && _s="?"
+    echo "$_s"
+}
+
+# 通知事件开关：**未配置视为开启**（向后兼容：旧配置里没有这几个选项，
+# 但旧行为是 DOWN/UP 都发，所以不能因为读不到就当成关闭）
+notify_wanted() {
+    [ "$(uci -q get ${CONF}.advanced.notify_$1)" = "0" ] && return 1
+    return 0
 }
 
 # 连接跟踪表清理模式读取（兼容旧版 flush_conntrack 开关）
@@ -19,94 +270,324 @@ get_flush_mode() {
     echo "$mode"
 }
 
+# ── Webhook 通知 ──────────────────────────────────────────────────────
+
+# 变量替换：把模板里的 $EVENT/$IFACE/... 换成实际值。
+# $1=模板  $2=1 表示对值做 URL 编码（URL 场景），否则原样（JSON body 场景）。
+# 依赖调用方先设好 EV_* 全局变量。
+#
+# ★★ 替换顺序不能随便改：带 `6` 的变量必须排在对应的 v4 变量**之前**。
+#    因为 sed 是纯文本替换 —— 若先跑 `s|\$WAN_IP|...|g`，模板里的 `$WAN_IPV6`
+#    会被当成 `$WAN_IP` + 尾巴 `V6`，替换成「1.2.3.4V6」。$IPV6/$IP、
+#    $PUBLIC_IPV6/$PUBLIC_IP 同理。
+subst_vars() {
+    local _t="$1" _enc="$2" _time _host
+    if [ "$_enc" = "1" ]; then
+        _time=$(urlenc "$EV_TIME"); _host=$(urlenc "$EV_HOST")
+    else
+        _time="$EV_TIME"; _host="$EV_HOST"
+    fi
+    printf '%s' "$_t" \
+        | sed "s|\$EVENT|$(sed_esc "$EV_EVENT")|g" \
+        | sed "s|\$OLD_IFACE|$(sed_esc "$EV_OLD_IFACE")|g" \
+        | sed "s|\$NEW_IFACE|$(sed_esc "$EV_NEW_IFACE")|g" \
+        | sed "s|\$IFACE|$(sed_esc "$EV_IFACE")|g" \
+        | sed "s|\$PUBLIC_IPV6|$(sed_esc "$EV_PUBLIC_IPV6")|g" \
+        | sed "s|\$PUBLIC_IP|$(sed_esc "$EV_PUBLIC_IP")|g" \
+        | sed "s|\$WAN_PREFIX6|$(sed_esc "$EV_WAN_PREFIX6")|g" \
+        | sed "s|\$WAN_IPV6|$(sed_esc "$EV_WAN_IPV6")|g" \
+        | sed "s|\$WAN_IP|$(sed_esc "$EV_WAN_IP")|g" \
+        | sed "s|\$TIER|$(sed_esc "$EV_TIER")|g" \
+        | sed "s|\$TIME|$(sed_esc "$_time")|g" \
+        | sed "s|\$HOSTNAME|$(sed_esc "$_host")|g" \
+        | sed "s|\$IPV6|$(sed_esc "$EV_WAN_IPV6")|g" \
+        | sed "s|\$IP|$(sed_esc "$EV_WAN_IP")|g"
+}
+
+# 记录「最近一次通知」结果，供「动作与通知」页展示（格式：时间|事件|线路|结果）
+record_webhook_last() {
+    printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" > "$WEBHOOK_LAST"
+}
+
 # 核心 Webhook 触发模块
 trigger_webhook() {
     local event="$1"; local active_wan="$2"; local is_test="$3"
-    local method=$(uci -q get ${CONF}.advanced.webhook_method || echo "GET")
-    
-    local ev_time=$(date '+%Y-%m-%d %H:%M:%S')
-    local ev_time_url=$(echo "$ev_time" | sed 's/ /%20/g') # GET 专用 URL 编码
-    local ev_host=$(uci -q get system.@system[0].hostname || cat /proc/sys/kernel/hostname 2>/dev/null || echo "OpenWrt")
-    local ev_ip=$(ubus call network.interface."$active_wan" status 2>/dev/null | jsonfilter -e '@.ipv4-address[0].address')
-    [ -z "$ev_ip" ] && ev_ip="未知IP"
 
-    # URL 全局渲染
-    local url=$(uci -q get ${CONF}.advanced.webhook_url | \
-        sed "s#\$EVENT#$event#g" | \
-        sed "s#\$IFACE#$active_wan#g" | \
-        sed "s#\$TIME#$ev_time_url#g" | \
-        sed "s#\$HOSTNAME#$ev_host#g" | \
-        sed "s#\$IP#$ev_ip#g")
-    
-    [ -z "$url" ] && return 0
-    
-    local dev=$(ubus call network.interface."$active_wan" status 2>/dev/null | jsonfilter -e '@.l3_device')
-    [ -z "$dev" ] && dev="auto"
-
-    log "正在发送 Webhook 通知（$method）"
-    
-    local payload=""
-    if [ "$method" = "POST" ]; then
-        payload=$(uci -q get ${CONF}.advanced.webhook_payload | \
-            sed "s#\$EVENT#$event#g" | \
-            sed "s#\$IFACE#$active_wan#g" | \
-            sed "s#\$TIME#$ev_time#g" | \
-            sed "s#\$HOSTNAME#$ev_host#g" | \
-            sed "s#\$IP#$ev_ip#g")
+    # 事件开关（手动测试不受开关限制，否则用户永远测不出问题）
+    if [ "$is_test" != "test" ]; then
+        case "$event" in
+            UP)     notify_wanted up     || return 0 ;;
+            DOWN)   notify_wanted down   || return 0 ;;
+            SWITCH) notify_wanted switch || return 0 ;;
+        esac
     fi
 
-    # 测试模式：记录全链路输出，不挂后台
+    local method=$(uci -q get ${CONF}.advanced.webhook_method); [ -z "$method" ] && method="GET"
+    local url_tpl=$(uci -q get ${CONF}.advanced.webhook_url)
+    [ -z "$url_tpl" ] && return 0
+
+    # ── 组装变量 ──
+    EV_EVENT="$event"
+    EV_IFACE="$active_wan"
+    EV_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    EV_HOST=$(uci -q get system.@system[0].hostname)
+    [ -z "$EV_HOST" ] && EV_HOST=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+    [ -z "$EV_HOST" ] && EV_HOST="OpenWrt"
+    # ★ $IP 历史上取的是「这条 WAN 口自己拿到的地址」（常是运营商内网/CGNAT 地址），
+    #   并不是公网出口 IP —— 但变量名叫 $IP，极易被误解。现在正式命名为 $WAN_IP，
+    #   $IP 保留为别名，避免破坏用户已有模板。
+    EV_WAN_IP=$(iface_ip "$active_wan"); [ -z "$EV_WAN_IP" ] && EV_WAN_IP="未知IP"
+    EV_WAN_IPV6=$(iface_ip6 "$active_wan"); [ -z "$EV_WAN_IPV6" ] && EV_WAN_IPV6="未知IPv6"
+    # $WAN_PREFIX6：该线路拿到的 PD 网段（形如 2408:824c:832:420::/60）。
+    # 与 $WAN_IPV6（WAN 口 /64 地址）不是一回事，两者前缀段通常不同。
+    EV_WAN_PREFIX6=$(iface_prefix6 "$active_wan"); [ -z "$EV_WAN_PREFIX6" ] && EV_WAN_PREFIX6="未知前缀"
+    EV_TIER=$(iface_tier "$active_wan")
+    EV_OLD_IFACE="${OLD_IFACE:-}"; [ -z "$EV_OLD_IFACE" ] && EV_OLD_IFACE="$active_wan"
+    EV_NEW_IFACE="${NEW_IFACE:-$active_wan}"
+
+    # TLS 校验策略：webhook 与「公网 IP 查询」共用同一个开关。
+    # ★ 旧版公网 IP 查询是无条件 -k（永远不校验证书），而 webhook 已经默认校验 ——
+    #   同一个页面里两套策略很别扭，现在统一跟随 webhook_insecure（默认校验）。
+    local insecure=$(uci -q get ${CONF}.advanced.webhook_insecure); [ "$insecure" = "1" ] || insecure="0"
+    local tls=""
+    [ "$insecure" = "1" ] && tls="-k"
+
+    # $PUBLIC_IP：可选。配了查询地址才发一次外网请求（5 秒超时），失败退回 WAN 口地址。
+    EV_PUBLIC_IP=""
+    local pub_url=$(uci -q get ${CONF}.advanced.public_ip_url)
+    if [ -n "$pub_url" ]; then
+        EV_PUBLIC_IP=$(curl -s -m 5 $tls "$pub_url" 2>/dev/null | tr -d '\r\n' | head -c 64)
+        if ! looks_like_ip "$EV_PUBLIC_IP"; then
+            [ -n "$EV_PUBLIC_IP" ] && log "公网 IPv4 查询返回的不是 IP，已忽略并回退：$(printf '%s' "$EV_PUBLIC_IP" | tr '\n' ' ' | head -c 60)"
+            EV_PUBLIC_IP=""
+        fi
+    fi
+    [ -z "$EV_PUBLIC_IP" ] && EV_PUBLIC_IP="$EV_WAN_IP"
+
+    # $PUBLIC_IPV6：同上，但**强制走 IPv6 发起**（-6）。
+    # ★ 为什么必须 -6：像 api64.ipify.org 这类双栈服务，在设备没有 IPv6 时会**返回 IPv4 地址**，
+    #   于是 $PUBLIC_IPV6 里会悄悄塞进一个 v4 地址 —— 静默错误，比查不到更糟。
+    #   加了 -6 之后没 v6 就是查询失败，回退到 $WAN_IPV6，语义明确。
+    EV_PUBLIC_IPV6=""
+    local pub6_url=$(uci -q get ${CONF}.advanced.public_ip6_url)
+    if [ -n "$pub6_url" ]; then
+        EV_PUBLIC_IPV6=$(curl -s -m 5 -6 $tls "$pub6_url" 2>/dev/null | tr -d '\r\n' | head -c 64)
+        if ! looks_like_ip "$EV_PUBLIC_IPV6"; then
+            [ -n "$EV_PUBLIC_IPV6" ] && log "公网 IPv6 查询返回的不是 IP，已忽略并回退：$(printf '%s' "$EV_PUBLIC_IPV6" | tr '\n' ' ' | head -c 60)"
+            EV_PUBLIC_IPV6=""
+        fi
+    fi
+    [ -z "$EV_PUBLIC_IPV6" ] && EV_PUBLIC_IPV6="$EV_WAN_IPV6"
+
+    # ── 渲染 URL / 请求体 ──
+    local url=$(subst_vars "$url_tpl" 1)
+    [ -z "$url" ] && return 0
+    local payload=""
+    [ "$method" = "POST" ] && payload=$(subst_vars "$(uci -q get ${CONF}.advanced.webhook_payload)" 0)
+
+    # ── 组装 curl 参数 ──
+    # POSIX sh 没有数组，用位置参数当数组（$1/$2/$3 早已存进局部变量，可以安全覆盖）
+    local retries=$(uci_num ${CONF}.advanced.webhook_retries 2 0 5)
+    local ctype=$(uci -q get ${CONF}.advanced.webhook_content_type); [ -z "$ctype" ] && ctype="application/json"
+    # ★ 强制绑定线路设备改为可选（默认关）。原来的行为是「一律 --interface <该线路设备>」，
+    #   但线路 DOWN 时 active_wan 正是刚挂掉的那条，强制走它反而更容易发不出通知；
+    #   目标在 LAN / 回环时也会直接失败。默认交给系统路由表，需要时才打开。
+    local force_if=$(uci -q get ${CONF}.advanced.webhook_force_iface); [ "$force_if" = "1" ] || force_if="0"
+    local dev=""
+    if [ "$force_if" = "1" ]; then
+        dev=$(iface_dev "$active_wan")
+        [ -z "$dev" ] && log "Webhook：线路 $active_wan 无可用设备，已忽略「强制绑定线路」"
+    fi
+
+    set -- curl -sS -m 10
+    [ "$retries" -gt 0 ] && set -- "$@" --retry "$retries" --retry-delay 2 --retry-connrefused
+    # ★ TLS 证书校验默认开启。旧版无条件加 -k（忽略证书），属于默认不安全。
+    [ "$insecure" = "1" ] && set -- "$@" -k
+    [ -n "$dev" ] && set -- "$@" --interface "$dev"
+    if [ "$method" = "POST" ]; then
+        set -- "$@" -X POST -H "Content-Type: $ctype"
+        [ -n "$payload" ] && set -- "$@" -d "$payload"
+    else
+        set -- "$@" -X GET
+    fi
+    # 自定义请求头：文本域一行一条 "Name: value"。
+    # ★ IFS 必须先改成只有换行，否则值里的空格会被拆成多个参数（真机验证过）。
+    local _h _oldifs="$IFS"
+    IFS='
+'
+    for _h in $(uci -q get ${CONF}.advanced.webhook_headers); do
+        [ -n "$_h" ] && set -- "$@" -H "$_h"
+    done
+    IFS="$_oldifs"
+    set -- "$@" "$url"
+
     if [ "$is_test" = "test" ]; then
+        # 测试模式：同步执行 + 全链路写日志，方便用户在「运行日志」页排查
         log "---------------------------------"
-        log "Webhook 测试"
+        log "Webhook 测试（$method）"
+        log "变量取值：EVENT=$EV_EVENT / IFACE=$EV_IFACE / TIER=$EV_TIER"
+        log "          WAN_IP=$EV_WAN_IP / WAN_IPV6=$EV_WAN_IPV6"
+        log "          WAN_PREFIX6=$EV_WAN_PREFIX6"
+        log "          PUBLIC_IP=$EV_PUBLIC_IP / PUBLIC_IPV6=$EV_PUBLIC_IPV6"
         log "目标地址：$url"
         [ "$method" = "POST" ] && log "请求内容：$payload"
         log "等待服务器响应（最长 10 秒）…"
-        
-        local res=""
-        if [ "$method" = "POST" ]; then
-            if [ "$dev" = "auto" ]; then
-                res=$(curl -sS -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" 2>&1)
-            else
-                res=$(curl -sS --interface "$dev" -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" 2>&1)
-            fi
-        else
-            if [ "$dev" = "auto" ]; then
-                res=$(curl -sS -X GET -k -m 10 "$url" 2>&1)
-            else
-                res=$(curl -sS --interface "$dev" -X GET -k -m 10 "$url" 2>&1)
-            fi
-        fi
-        
-        log "服务器返回：$res"
+        local res rc
+        res=$("$@" 2>&1); rc=$?
+        # ★ 必须换行→空格 + 截断：服务器返回的可能是整页 HTML，
+        #   直接塞进日志会把单行格式打散、并挤掉前后所有有用信息（真机实测）。
+        log "服务器返回（rc=$rc）：$(printf '%s' "$res" | tr '\n' ' ' | head -c 200)"
         log "---------------------------------"
+        record_webhook_last "$EV_TIME" "$event" "$active_wan" "测试 rc=$rc"
     else
-        # 生产模式：静默后台执行
-        if [ "$method" = "POST" ]; then
-            if [ "$dev" = "auto" ]; then
-                curl -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" >/dev/null 2>&1 &
+        # 生产模式：后台发送（不阻塞探测），但把结果落到「最近一次通知」，失败写日志。
+        # ★ 用 log_append 而不是 log：后台进程不能参与日志轮转，否则会和主循环抢 .tmp
+        (
+            _res=$("$@" 2>&1); _rc=$?
+            _now=$(date '+%Y-%m-%d %H:%M:%S')
+            if [ "$_rc" -eq 0 ]; then
+                record_webhook_last "$_now" "$event" "$active_wan" "成功"
             else
-                curl --interface "$dev" -X POST -H "Content-Type: application/json; charset=utf-8" -d "$payload" -k -m 10 "$url" >/dev/null 2>&1 &
+                record_webhook_last "$_now" "$event" "$active_wan" "失败 rc=$_rc"
+                log_append "Webhook 发送失败（$event / $active_wan，rc=$_rc）：$(printf '%s' "$_res" | tr '\n' ' ' | head -c 200)"
             fi
+        ) &
+    fi
+}
+
+# ── 自定义脚本（Hook） ────────────────────────────────────────────────
+
+# 执行用户脚本。
+# ★ 必须加超时：这段在探测循环里执行，脚本里一个 sleep、一个没加 -m 的 curl、
+#   或者一个等待输入的 read，就会让整轮探测停摆 —— 此后线路状态不再更新、
+#   故障切换彻底失效。加超时后最坏情况只是这一轮慢 15 秒。
+# ★ 超时用 run_hook_script()，不要直接写 `timeout` —— 有的固件根本没有这个命令
+#   （见 run_hook_script 上方注释）。
+# $1=up|down  $2=线路名  $3=test 表示手动测试
+run_hook() {
+    local _dir="$1" _iface="$2" _is_test="$3"
+    local _label="线路$([ "$_dir" = "up" ] && echo 恢复 || echo 离线)"
+    local _script=$(uci -q get ${CONF}.advanced.hook_$_dir)
+
+    if [ -z "$_script" ]; then
+        if [ "$_is_test" = "test" ]; then
+            log "Hook 测试：未配置「${_label}时执行的脚本」，已跳过。"
+        fi
+        return 0
+    fi
+
+    local _to=$(uci_num ${CONF}.advanced.hook_timeout 15 1 300)
+    local _bg=$(uci -q get ${CONF}.advanced.hook_background); [ "$_bg" = "1" ] || _bg="0"
+    # 脚本输出的落地文件。★ 必须让调用方命名：run_hook_script 要先把输出重定向到
+    # 文件再回读，否则孙进程会拖住 $( ) 的管道（详见其注释）。名字用
+    # `$$.$_dir.$_iface` 就足够唯一 —— 同一轮里一条线路不可能同时 up 和 down。
+    local _hook_of="/tmp/.xxwan_hook.$$.$_dir.$_iface"
+
+    # 变量集与 Webhook 对齐（旧版只有 XXWAN_EVENT / XXWAN_IFACE）
+    XXWAN_EVENT=$(echo "$_dir" | tr 'a-z' 'A-Z'); export XXWAN_EVENT
+    export XXWAN_IFACE="$_iface"
+    export XXWAN_TIER="$(iface_tier "$_iface")"
+    XXWAN_IP=$(iface_ip "$_iface"); [ -z "$XXWAN_IP" ] && XXWAN_IP="未知IP"
+    export XXWAN_IP
+    export XXWAN_WAN_IP="$XXWAN_IP"
+    XXWAN_IPV6=$(iface_ip6 "$_iface"); [ -z "$XXWAN_IPV6" ] && XXWAN_IPV6="未知IPv6"
+    export XXWAN_IPV6
+    export XXWAN_WAN_IPV6="$XXWAN_IPV6"
+    XXWAN_WAN_PREFIX6=$(iface_prefix6 "$_iface"); [ -z "$XXWAN_WAN_PREFIX6" ] && XXWAN_WAN_PREFIX6="未知前缀"
+    export XXWAN_WAN_PREFIX6
+    export XXWAN_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+    XXWAN_HOSTNAME=$(uci -q get system.@system[0].hostname)
+    [ -z "$XXWAN_HOSTNAME" ] && XXWAN_HOSTNAME="OpenWrt"
+    export XXWAN_HOSTNAME
+    export XXWAN_OLD_IFACE="${OLD_IFACE:-$_iface}"
+    export XXWAN_NEW_IFACE="${NEW_IFACE:-$_iface}"
+
+    if [ "$_is_test" = "test" ]; then
+        log "Hook 测试：执行「${_label}」脚本（超时 ${_to}s，线路名 TEST_IFACE）"
+        local _out _rc
+        _out=$(run_hook_script "$_hook_of" "$_to" "$_script" 2>&1); _rc=$?
+        # ★ 脚本输出可能是多行，日志是单行格式 —— 换行转空格再截断
+        _out=$(printf '%s' "$_out" | tr '\n' ' ' | head -c 200)
+        if [ "$_rc" -eq 0 ]; then
+            log "Hook 测试：执行成功${_out:+，输出：$_out}"
+        elif [ "$_rc" -eq 124 ]; then
+            log "Hook 测试：★ 执行超时（已到 ${_to}s，被强制终止）"
         else
-            if [ "$dev" = "auto" ]; then
-                curl -X GET -k -m 10 "$url" >/dev/null 2>&1 &
-            else
-                curl --interface "$dev" -X GET -k -m 10 "$url" >/dev/null 2>&1 &
+            log "Hook 测试：执行失败 rc=$_rc${_out:+，输出：$_out}"
+        fi
+        return 0
+    fi
+
+    if [ "$_bg" = "1" ]; then
+        # 后台执行：完全不阻塞探测，但脚本与后续动作的先后顺序不再有保证
+        (
+            _out=$(run_hook_script "$_hook_of" "$_to" "$_script" 2>&1); _rc=$?
+            _out=$(printf '%s' "$_out" | tr '\n' ' ' | head -c 200)
+            if [ "$_rc" -eq 124 ]; then
+                log_append "Hook 脚本（${_label} / $_iface）执行超时（${_to}s 被强制终止）"
+            elif [ "$_rc" -ne 0 ]; then
+                log_append "Hook 脚本（${_label} / $_iface）rc=$_rc：$_out"
             fi
+        ) &
+    else
+        # 同步执行但有界：保留脚本的执行顺序（脚本里改路由/改 DNS 才有确定性）
+        local _out _rc
+        _out=$(run_hook_script "$_hook_of" "$_to" "$_script" 2>&1); _rc=$?
+        _out=$(printf '%s' "$_out" | tr '\n' ' ' | head -c 200)
+        if [ "$_rc" -eq 124 ]; then
+            log "Hook 脚本（${_label} / $_iface）执行超时（${_to}s 被强制终止）"
+        elif [ "$_rc" -ne 0 ]; then
+            log "Hook 脚本（${_label} / $_iface）rc=$_rc：$_out"
         fi
     fi
 }
 
+# ── 手动测试入口（页面按钮调用）───────────────────────────────────────
+# 用法：xxwan-daemon test_webhook [线路名]
+#   不传线路名 → 用模拟值 WAN_TEST（页面「发送测试」按钮走这条，$WAN_IP/$WAN_IPV6 会是「未知」）。
+#   传真实线路名（如 wan1）→ 用该线路的真实取值，命令行排查时有用。
 if [ "$1" = "test_webhook" ]; then
+    _t_iface="${2:-WAN_TEST}"
     log "========== 用户手动触发 Webhook 测试 =========="
-    trigger_webhook "TEST_DOWN" "WAN_TEST" "test"
+    OLD_IFACE=""; NEW_IFACE="$_t_iface"
+    trigger_webhook "TEST_DOWN" "$_t_iface" "test"
+    exit 0
+fi
+
+if [ "$1" = "test_hook" ]; then
+    log "========== 用户手动触发 Hook 脚本测试 =========="
+    OLD_IFACE=""; NEW_IFACE="TEST_IFACE"
+    run_hook "$2" "TEST_IFACE" "test"
+    exit 0
+fi
+
+# ── IPv6 解析自检（只读，不改任何配置）────────────────────────────────
+# 用法：xxwan-daemon v6name <ifname>
+#   为什么要有它：OpenWrt 把 IPv6 挂在独立接口（wan6）上，而 xxwan 配的是 wan。
+#   在没有 IPv6 的机器上无法端到端验证，但**解析逻辑本身**可以单独验证：
+#   本命令打印「给定 ifname → 解析出的 v6 接口名 → 该接口的 v6/v4 地址 + PD 前缀」，
+#   并列出设备上真实存在的接口，便于确认回退路径不会凭空造出不存在的接口名。
+#   ★ 在装了 xxwan 的 IPv6 真机上跑一次 `xxwan-daemon v6name <ifname>`，即可只读地
+#     核对 $WAN_IPV6（ip6）与 $WAN_PREFIX6（prefix6）的真实取值。
+if [ "$1" = "v6name" ]; then
+    _q="$2"
+    [ -z "$_q" ] && { echo "用法：xxwan-daemon v6name <ifname>"; exit 1; }
+    echo "ifname     : $_q"
+    echo "v6name     : $(iface_v6_name "$_q")"
+    echo "l3_device  : $(iface_dev "$_q")"
+    echo "ip6        : $(iface_ip6 "$_q")"
+    echo "prefix6    : $(iface_prefix6 "$_q")"
+    echo "ip4        : $(iface_ip "$_q")"
+    echo "--- ubus 里真实存在的 network 接口 ---"
+    ubus list 'network.interface.*' 2>/dev/null | sed 's/^network\.interface\.//' | tr '\n' ' '; echo
+    echo "--- network 配置里 device='@...' 的接口（v6 查找依据）---"
+    uci -q show network 2>/dev/null | grep "device='@" || echo "(无)"
     exit 0
 fi
 
 check_iface() {
     local iface="$1"; local c_type="$2"; local c_tgt="$3"; local c_url="$4"; local c_code="$5"
-    local dev=$(ubus call network.interface."$iface" status 2>/dev/null | jsonfilter -e '@.l3_device')
+    local dev=$(ubus call network.interface."$iface" status 2>/dev/null | jsonfilter -e '@["l3_device"]')
     [ -z "$dev" ] && return 1
     if [ "$c_type" = "ping" ]; then
         for ip in $c_tgt; do 
@@ -156,8 +637,8 @@ sync_network_state() {
 
     ip route show | grep "metric 1" | grep "default" | while read -r line; do ip route del $line 2>/dev/null; done
     if [ -n "$best_iface" ]; then
-        local alive_gw=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@.route[0].nexthop')
-        local alive_dev=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@.l3_device')
+        local alive_gw=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@["route"][0]["nexthop"]')
+        local alive_dev=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@["l3_device"]')
         if [ -n "$alive_dev" ]; then
             if [ -n "$alive_gw" ] && [ "$alive_gw" != "0.0.0.0" ]; then
                 ip route add default via "$alive_gw" dev "$alive_dev" metric 1 2>/dev/null
@@ -166,6 +647,21 @@ sync_network_state() {
                 ip route add default dev "$alive_dev" metric 1 2>/dev/null
             fi
         fi
+    fi
+
+    # ── 出口切换事件 ──
+    # 用户最关心的是「出口从 A 换到 B」，而不是分别收到「A 离线」「B 恢复」两条通知
+    # 再自己拼。这里比较上一次记录的出口，变了就发一条 $EVENT=SWITCH 的通知，
+    # 变量里带 $OLD_IFACE / $NEW_IFACE。
+    # 首轮不触发：引擎刚启动时没有"上一次出口"可比，否则每次重启都会误报一次切换。
+    local prev_iface=$(cat "$EGRESS_FILE" 2>/dev/null)
+    if [ -n "$best_iface" ] && [ "$prev_iface" != "$best_iface" ]; then
+        if [ -n "$prev_iface" ] && [ "$FIRST_RUN" -ne 1 ]; then
+            OLD_IFACE="$prev_iface"; NEW_IFACE="$best_iface"
+            trigger_webhook "SWITCH" "$best_iface" ""
+            OLD_IFACE=""; NEW_IFACE=""
+        fi
+        printf '%s\n' "$best_iface" > "$EGRESS_FILE"
     fi
 
     uci show pbr | grep -E "=policy" | cut -d'.' -f2 | cut -d'=' -f1 | grep "^xxwan_" | while read -r section; do uci delete pbr.${section}; done
@@ -231,21 +727,77 @@ sync_network_state() {
     /etc/init.d/pbr restart >/dev/null 2>&1
     log "PBR 策略已更新（$pbr_log_msg）"
 
-    # 连接跟踪表清理：按配置的时机执行
+    # ── 连接跟踪表清理 ──
+    # ★ 「仅线路恢复时清除」原来读 $event_type，而 event_type = 本轮最后一个发生状态变化的
+    #   线路（循环里 up/down 互相覆盖）—— 同一轮里一 up 一 down 时，清不清取决于循环顺序，
+    #   结果不确定。改用 HAS_UP 显式判断。
     local flush_mode=$(get_flush_mode)
     local do_flush=0
     case "$flush_mode" in
         always)  do_flush=1 ;;
-        restore) [ "$event_type" = "up" ] && do_flush=1 ;;
+        restore) [ "$HAS_UP" = "1" ] && do_flush=1 ;;
         *)       do_flush=0 ;;
     esac
-    if [ "$do_flush" -eq 1 ]; then
-        log "清除连接跟踪表（会中断当前所有连接）"
-        conntrack -F >/dev/null 2>&1
+
+    # ★ 首轮（引擎刚启动 / 刚重启设备）不是「线路切换」。默认不执行清表与服务重启，
+    #   否则每重启一次引擎都会清空连接跟踪表、并把你配的服务全部重启一遍 ——
+    #   即使一条线路都没切换过。可在页面用「引擎启动时也执行上述动作」开启。
+    local on_boot=$(uci -q get ${CONF}.advanced.actions_on_boot); [ "$on_boot" = "1" ] || on_boot="0"
+    local is_boot=0
+    [ "$FIRST_RUN" -eq 1 ] && is_boot=1
+    if [ "$is_boot" -eq 1 ] && [ "$on_boot" != "1" ]; then
+        do_flush=0
     fi
 
+    if [ "$do_flush" -eq 1 ]; then
+        local scope=$(uci -q get ${CONF}.advanced.conntrack_scope); [ -z "$scope" ] && scope="all"
+        if [ "$scope" = "iface" ]; then
+            # 只清与刚离线的线路相关的连接：按该线路 SNAT 后的地址删。
+            # ⚠ 尽力而为：conntrack 1.4.8 没有接口过滤，只能按地址匹配，
+            #   所以没走 NAT 的流量无法归属到具体线路，可能漏删。
+            local _n=0 _if _ip
+            for _if in $DOWN_IFACES; do
+                _ip=$(iface_ip "$_if")
+                [ -z "$_ip" ] && continue
+                conntrack -D -n "$_ip" >/dev/null 2>&1
+                conntrack -D -s "$_ip" >/dev/null 2>&1
+                _n=$((_n + 1))
+            done
+            if [ "$_n" -gt 0 ]; then
+                log "清除连接跟踪表（仅故障线路相关，涉及 $_n 条线路）"
+            else
+                log "清除连接跟踪表（仅故障线路相关）—— 本轮无线路离线，跳过"
+            fi
+        else
+            log "清除连接跟踪表（会中断当前所有连接）"
+            conntrack -F >/dev/null 2>&1
+        fi
+    fi
+
+    # ── 关联服务 ──
+    # ★ 原实现是 `log ... && /etc/init.d/"$svc" restart`，服务名写错也静默通过、毫无反馈。
+    #   现在先校验脚本存在，并把成功/失败都写进日志。
     local svcs=$(uci -q get ${CONF}.advanced.reload_services)
-    for svc in $svcs; do [ -n "$svc" ] && log "正在重启关联服务：$svc" && /etc/init.d/"$svc" restart >/dev/null 2>&1; done
+    local svc_act=$(uci -q get ${CONF}.advanced.reload_action); [ -z "$svc_act" ] && svc_act="restart"
+    if [ -n "$svcs" ]; then
+        if [ "$is_boot" -eq 1 ] && [ "$on_boot" != "1" ]; then
+            log "引擎首轮启动：按设置跳过关联服务（如需执行请在「动作与通知」页开启）"
+        else
+            local svc
+            for svc in $svcs; do
+                [ -z "$svc" ] && continue
+                if [ ! -x "/etc/init.d/$svc" ]; then
+                    log "★ 关联服务 $svc 不存在（无 /etc/init.d/$svc），已跳过 —— 请检查配置"
+                    continue
+                fi
+                if /etc/init.d/"$svc" "$svc_act" >/dev/null 2>&1; then
+                    log "关联服务 $svc：$svc_act 完成"
+                else
+                    log "★ 关联服务 $svc：$svc_act 失败"
+                fi
+            done
+        fi
+    fi
 
     [ -z "$status_html" ] && status_html="<span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>全部离线或未配置接口</span>"
     if [ "$gmode" != "auto" ]; then status_html="${status_html} <br/><span style='color:var(--info, var(--primary-color-high, var(--primary, #5e72e4))); font-size:12px; margin-top:5px; display:block;'>手动锁定出口：<b>${gmode#force_}</b></span>"; fi
@@ -308,6 +860,15 @@ while true; do
 
     STATE_CHANGED=0
     LAST_EVT="init"
+    # 本轮状态变化的方向标志（给 sync_network_state 判断「仅线路恢复时清除」用，
+    # 取代原来那个会被循环覆盖、结果不确定的 LAST_EVT）
+    HAS_UP=0
+    HAS_DOWN=0
+    # 本轮刚离线的线路（给「仅清故障线路相关连接」用）
+    DOWN_IFACES=""
+    # 出口切换变量：每轮清空，只有 SWITCH 检测到变化时才填
+    OLD_IFACE=""
+    NEW_IFACE=""
     IFACES=$(uci -q show ${CONF} | grep "=interface" | cut -d'.' -f2 | cut -d'=' -f1)
     
     touch /tmp/xxwan_state_new
@@ -336,13 +897,14 @@ while true; do
                 if [ "$rest_cnt" -ge "$REST_THRESH" ]; then
                     new_status="STATUS:UP"
                     log "线路 $ifname 连续 $REST_THRESH 次探测成功，已恢复在线"
+                    HAS_UP=1
+                    # ★ 这里原来有一行 `NEW_IFACE="$ifname"`，已删除：
+                    #   NEW_IFACE 是「出口切换到谁」的语义，只该由下面的 SWITCH 逻辑设置。
+                    #   同一轮里若先有线路 UP、后有线路 DOWN，残留值会让 DOWN 通知的
+                    #   $NEW_IFACE 张冠李戴（报成另一条线路）。删除零副作用 ——
+                    #   UP 事件自己的 EV_NEW_IFACE 本来就回落到 $active_wan（= $ifname）。
                     trigger_webhook "UP" "$ifname" ""
-                    h_up=$(uci -q get ${CONF}.advanced.hook_up)
-                    if [ -n "$h_up" ]; then
-                        log "执行恢复时自定义脚本"
-                        export XXWAN_EVENT="UP"; export XXWAN_IFACE="$ifname"
-                        eval "$h_up"
-                    fi
+                    run_hook "up" "$ifname" ""
                     STATE_CHANGED=1
                     LAST_EVT="up"
                 else
@@ -359,13 +921,10 @@ while true; do
                 if [ "$fail_cnt" -ge "$FAIL_THRESH" ]; then
                     new_status="STATUS:DOWN"
                     log "线路 $ifname 连续 $FAIL_THRESH 次探测失败，判定离线"
+                    HAS_DOWN=1
+                    DOWN_IFACES="$DOWN_IFACES $ifname"
                     trigger_webhook "DOWN" "$ifname" ""
-                    h_down=$(uci -q get ${CONF}.advanced.hook_down)
-                    if [ -n "$h_down" ]; then
-                        log "执行离线时自定义脚本"
-                        export XXWAN_EVENT="DOWN"; export XXWAN_IFACE="$ifname"
-                        eval "$h_down"
-                    fi
+                    run_hook "down" "$ifname" ""
                     STATE_CHANGED=1
                     LAST_EVT="down"
                 else
