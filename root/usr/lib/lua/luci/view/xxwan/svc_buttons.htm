@@ -1,5 +1,5 @@
 <%#
- XXWAN 双按钮行（启动 / 停止）：把两个按钮渲染在同一行。
+ XXWAN 双按钮行：把两个按钮渲染在同一行。
 
  为什么需要这个模板：
    cbi/button.htm 让每个 Button 选项独占一行 cbi-value；而 cbi/full_valueheader.htm 只在
@@ -7,12 +7,14 @@
    直接贴在 cbi-value 里、左侧没有缩进 —— 看上去就是"错位"。
 
  用法：后端定义一个 Button 选项并指向本模板，然后设置
-   inputtitle  / inputstyle    第一个按钮（启动）的文字与样式
-   inputtitle2 / inputstyle2   第二个按钮（停止）的文字与样式
+   inputtitle  / inputstyle  / inputvalue    第一个按钮的文字、样式、提交值
+   inputtitle2 / inputstyle2 / inputvalue2   第二个按钮同上
  两个 button 共用同一个 name（即 cbid），浏览器只提交「被点击的那一个」，
- 后端在 write(self, section, value) 里按 value 的 start / stop 区分动作。
+ 后端在 write(self, section, value) 里按 value 区分动作。
+
+ 默认提交值为 start / stop（服务启停用）；其它场景可覆盖，例如 hook 测试用 up / down。
 -%>
 <%+cbi/valueheader%>
-	<button class="btn cbi-button cbi-button-<%=self.inputstyle or "apply"%>" type="submit" name="<%=cbid%>" id="<%=cbid%>_start" value="start"><%=pcdata(self.inputtitle)%></button>
-	<button class="btn cbi-button cbi-button-<%=self.inputstyle2 or "remove"%>" type="submit" name="<%=cbid%>" id="<%=cbid%>_stop" value="stop"><%=pcdata(self.inputtitle2)%></button>
+	<button class="btn cbi-button cbi-button-<%=self.inputstyle or "apply"%>" type="submit" name="<%=cbid%>" id="<%=cbid%>_1" value="<%=self.inputvalue or "start"%>"><%=pcdata(self.inputtitle)%></button>
+	<button class="btn cbi-button cbi-button-<%=self.inputstyle2 or "remove"%>" type="submit" name="<%=cbid%>" id="<%=cbid%>_2" value="<%=self.inputvalue2 or "stop"%>"><%=pcdata(self.inputtitle2)%></button>
 <%+cbi/valuefooter%>
