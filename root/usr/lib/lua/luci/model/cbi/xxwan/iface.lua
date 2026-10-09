@@ -8,10 +8,10 @@ local note = s_note:option(DummyValue, "_tier_note", "")
 note.rawhtml = true
 note.cfgvalue = function(self, section)
     return [[
-        <div style="line-height:1.9; color:var(--text-muted);">
-            <div><b style="color:var(--text);">主干宽带 (Tier 1)</b> — 默认出口，在线时流量走这条</div>
-            <div><b style="color:var(--text);">次级备线 (Tier 2)</b> — 主干离线时自动接管</div>
-            <div><b style="color:var(--text);">末级兜底 (Tier 3)</b> — 前两级都离线时才启用</div>
+        <div style="line-height:1.9; color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));">
+            <div><b style="color:var(--text, var(--text-color-high, var(--default, #172b4d)));">主干宽带 (Tier 1)</b> — 默认出口，在线时流量走这条</div>
+            <div><b style="color:var(--text, var(--text-color-high, var(--default, #172b4d)));">次级备线 (Tier 2)</b> — 主干离线时自动接管</div>
+            <div><b style="color:var(--text, var(--text-color-high, var(--default, #172b4d)));">末级兜底 (Tier 3)</b> — 前两级都离线时才启用</div>
             <div style="margin-top:8px;">系统按优先级 1 到 3 的顺序，选择第一条在线的线路作为出口；高优先级线路恢复在线后会自动切回。</div>
         </div>
     ]]

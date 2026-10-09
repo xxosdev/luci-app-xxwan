@@ -17,38 +17,98 @@ uci:foreach("xxwan", "interface", function(sec)
 end)
 gmode.default = "auto"
 
+-- 引擎运行状态 + 服务控制
+-- 背景：安装脚本不会自动启动服务；只给「启用 XXWAN」开关时，用户不知道还要启动引擎，
+-- 而命令行 start 在 enabled≠1 时会静默返回（rc=0 但不起进程），极易被误判成"启动不了"。
+local svc_state = s_top:option(DummyValue, "svc_state", translate("引擎运行状态"))
+svc_state.template = "cbi/dvalue"
+function svc_state.cfgvalue(self, section)
+    local running = (sys.call("pidof xxwan-daemon >/dev/null 2>&1") == 0)
+    local en_val = uci:get("xxwan", "main", "enabled")
+    local res
+    if running then
+        res = "<span style='color:var(--success, var(--success-color-high, #2dce89));font-weight:bold;'>[运行中]</span>"
+    else
+        res = "<span style='color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;'>[未运行]</span>"
+    end
+    if en_val ~= "1" then
+        res = res .. " <span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>(已禁用：xxwan.main.enabled=0，需先勾选上面的「启用 XXWAN」)</span>"
+    end
+    return res
+end
+svc_state.rawhtml = true
+
+-- ★ 两个按钮必须画在同一行：LuCI 的 Button 选项每个独占一行，而且
+--   cbi/full_valueheader.htm 只在选项有 title 时才输出 cbi-value-field 包裹 —— 所以
+--   「没有 title 的第二个按钮」会贴到最左边、与上面的按钮错位。
+--   这里只定义一个 Button 选项，由 view/xxwan/svc_buttons.htm 一次画出两个按钮：
+--   二者共用同一个 name，浏览器只提交被点击的那一个，后端按 value 的 start/stop 区分动作。
+local svc_ctl = s_top:option(Button, "_svc_ctl", translate("服务控制"),
+    translate("「启动服务」会自动勾选「启用 XXWAN」并立即启动后台引擎；「停止服务」只停引擎，不改变启用开关（重启设备后仍会自启）。"))
+svc_ctl.template = "xxwan/svc_buttons"
+svc_ctl.inputtitle = translate("启动服务")
+svc_ctl.inputstyle = "apply"
+svc_ctl.inputtitle2 = translate("停止服务")
+svc_ctl.inputstyle2 = "remove"
+function svc_ctl.write(self, section, value)
+    if value == "stop" then
+        sys.call("/etc/init.d/xxwan stop >/dev/null 2>&1")
+    else
+        sys.call("uci set xxwan.main.enabled='1' 2>/dev/null")
+        sys.call("uci commit xxwan 2>/dev/null")
+        sys.call("/etc/init.d/xxwan start >/dev/null 2>&1")
+    end
+    sys.call("rm -f /tmp/luci-indexcache* 2>/dev/null")
+end
+
 -- 线路运行状态
 local s_stat = m:section(NamedSection, "status", "status", translate("线路状态"))
 s_stat.anonymous = true
 local cur = s_stat:option(DummyValue, "active_nodes", translate("当前状态"))
 cur.template = "cbi/dvalue"
-function cur.cfgvalue(self, section) return uci:get("xxwan", "status", "active_nodes") or "<span style='color:var(--text-muted);'>等待探测…</span>" end
+function cur.cfgvalue(self, section) return uci:get("xxwan", "status", "active_nodes") or "<span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>等待探测…</span>" end
 cur.rawhtml = true
 
 local pbr_stat = s_stat:option(DummyValue, "pbr_status", translate("PBR 服务状态"))
 pbr_stat.template = "cbi/dvalue"
 function pbr_stat.cfgvalue(self, section)
-    if sys.call("test -f /etc/init.d/pbr") ~= 0 then return "<span style='color:var(--danger);font-weight:bold;'>[未安装]</span> 请先在软件包中安装 pbr" end
+    if sys.call("test -f /etc/init.d/pbr") ~= 0 then return "<span style='color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;'>[未安装]</span> 请先在软件包中安装 pbr" end
     local running = (sys.call("/etc/init.d/pbr running 2>/dev/null") == 0)
     local enabled = (sys.call("/etc/init.d/pbr enabled 2>/dev/null") == 0)
     -- pbr.config.enabled 是功能开关，为 0 时 restart 也不会真正启动
     local func_en = uci:get("pbr", "config", "enabled")
     local res = ""
-    if running then res = res .. "<span style='color:var(--success);font-weight:bold;'>[运行中]</span> " else res = res .. "<span style='color:var(--danger);font-weight:bold;'>[已停止]</span> " end
-    if func_en ~= "1" then res = res .. "<span style='color:var(--danger);font-weight:bold;'>[功能未启用，分流不生效]</span> " end
-    if enabled then res = res .. "<span style='color:var(--info);'>[开机自启已配置]</span>" else res = res .. "<span style='color:var(--text-muted);'>[开机自启未配置]</span>" end
+    if running then res = res .. "<span style='color:var(--success, var(--success-color-high, #2dce89));font-weight:bold;'>[运行中]</span> " else res = res .. "<span style='color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;'>[已停止]</span> " end
+    if func_en ~= "1" then res = res .. "<span style='color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;'>[功能未启用，分流不生效]</span> " end
+    if enabled then res = res .. "<span style='color:var(--info, var(--primary-color-high, var(--primary, #5e72e4)));'>[开机自启已配置]</span>" else res = res .. "<span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>[开机自启未配置]</span>" end
     return res
 end
 pbr_stat.rawhtml = true
 
-local pbr_btn = s_stat:option(Button, "_pbr_btn", translate("PBR 操作"), translate("将 pbr.config.enabled 设为 1 并重启服务。点击后需再点「保存并应用」才会执行。"))
-pbr_btn.inputtitle = translate("启用并重启 PBR"); pbr_btn.inputstyle = "apply"
-function pbr_btn.write(self, section)
-    -- 必须先开功能开关，否则 restart 会被 pbr 拒绝启动
-    sys.call("uci set pbr.config.enabled='1' 2>/dev/null")
-    sys.call("uci commit pbr 2>/dev/null")
-    sys.call("/etc/init.d/pbr enable >/dev/null 2>&1")
-    sys.call("/etc/init.d/pbr restart >/dev/null 2>&1")
+-- PBR 操作：同样用 svc_buttons.htm 把「启用」和「停止」放在一行
+--   「启用并重启 PBR」= 功能开关置 1 + 配置开机自启 + restart
+--   「停止 PBR」      = 功能开关置 0 + 取消开机自启 + stop（彻底关闭，重启设备也不会自己起来）
+local pbr_btn = s_stat:option(Button, "_pbr_btn", translate("PBR 操作"),
+    translate("「启用并重启 PBR」会把 pbr.config.enabled 设为 1、配置开机自启并重启服务；「停止 PBR」则设为 0、取消开机自启并停止服务（之后 XXWAN 的分流与故障切换都会失效）。"))
+pbr_btn.template = "xxwan/svc_buttons"
+pbr_btn.inputtitle = translate("启用并重启 PBR")
+pbr_btn.inputstyle = "apply"
+pbr_btn.inputtitle2 = translate("停止 PBR")
+pbr_btn.inputstyle2 = "remove"
+function pbr_btn.write(self, section, value)
+    if value == "stop" then
+        -- 先置 0 再 stop：否则 pbr 的 restart/自启会把规则又装回去
+        sys.call("uci set pbr.config.enabled='0' 2>/dev/null")
+        sys.call("uci commit pbr 2>/dev/null")
+        sys.call("/etc/init.d/pbr disable >/dev/null 2>&1")
+        sys.call("/etc/init.d/pbr stop >/dev/null 2>&1")
+    else
+        -- 必须先开功能开关，否则 restart 会被 pbr 拒绝启动
+        sys.call("uci set pbr.config.enabled='1' 2>/dev/null")
+        sys.call("uci commit pbr 2>/dev/null")
+        sys.call("/etc/init.d/pbr enable >/dev/null 2>&1")
+        sys.call("/etc/init.d/pbr restart >/dev/null 2>&1")
+    end
 end
 s_stat:option(DummyValue, "last_event", translate("最近事件"))
 

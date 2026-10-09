@@ -2,21 +2,36 @@
 START=95; STOP=10; USE_PROCD=1
 start_service() {
     local enabled=$(uci -q get xxwan.main.enabled)
-    [ "$enabled" = "1" ] || return 0
+    # ★ enabled 不是 1 时必须给出明确提示：否则 start 会「成功返回但什么都不做」
+    #   （实测 rc=0、零输出、无进程），用户完全无法判断服务为什么没起来。
+    if [ "$enabled" != "1" ]; then
+        echo "XXWAN 未启用（xxwan.main.enabled=$enabled），已跳过启动。"
+        echo "如需启用：uci set xxwan.main.enabled=1 && uci commit xxwan && /etc/init.d/xxwan start"
+        return 0
+    fi
     procd_open_instance
     procd_set_param command /usr/sbin/xxwan-daemon
     procd_set_param respawn
     procd_close_instance
 }
 reload_service() { stop; start; }
-stop_service() {
-    killall -9 xxwan-daemon 2>/dev/null
+
+# ★ 停止交给 procd：rc.common 的 stop() 顺序是
+#     stop_service -> procd_kill -> service_stopped
+#   所以这里什么都不做，让 procd 优雅停掉 daemon —— 不会像 killall -9 那样被当成
+#   「异常退出」触发 respawn，从而避免与随后的 start 抢、出现双重启动。
+stop_service() { :; }
+
+# 清理放在 service_stopped：此时 procd 已停掉实例，清理不会被 daemon 重新改回去；
+# 也避免在 stop_service 里自己调 procd_kill —— 那样 rc.common 随后再调一次会报
+# "ubus call service delete ... (Not found)"。
+service_stopped() {
     ip route show | grep "metric 1" | grep "default" | while read -r line; do ip route del $line 2>/dev/null; done
     uci show pbr | grep -E "=policy" | cut -d'.' -f2 | cut -d'=' -f1 | grep "^xxwan_" | while read -r section; do uci delete pbr.${section}; done
     uci commit pbr
     /etc/init.d/pbr reload >/dev/null 2>&1
     rm -f /tmp/xxwan_state
-    uci set xxwan.status.active_nodes="<span style='color:var(--danger);'>服务已停止</span>"
+    uci set xxwan.status.active_nodes="<span style='color:var(--danger, var(--error-color-high, #f5365c));'>服务已停止</span>"
     uci set xxwan.status.last_event="服务已停止"
     uci commit xxwan
 }

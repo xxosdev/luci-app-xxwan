@@ -18,7 +18,7 @@ btn.cfgvalue = function()
     return [[
         <div style="margin-bottom: 15px; display: flex; gap: 15px; align-items: center;">
             <input class="cbi-button cbi-button-apply" type="button" value="刷新日志" onclick="location.href=']] .. url .. [['" />
-            <input class="cbi-button cbi-button-action" type="button" value="清空日志" style="color:var(--danger);font-weight:bold;" onclick="if(confirm('确定清空 XXWAN 运行日志？')){location.href=']] .. url .. [[?clear_log=1'}" />
+            <input class="cbi-button cbi-button-action" type="button" value="清空日志" style="color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;" onclick="if(confirm('确定清空 XXWAN 运行日志？')){location.href=']] .. url .. [[?clear_log=1'}" />
         </div>
     ]]
 end

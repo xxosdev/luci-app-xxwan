@@ -54,6 +54,9 @@ define Package/luci-app-xxwan/install
 
 	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/model/cbi/xxwan
 	$(INSTALL_DATA) ./root/usr/lib/lua/luci/model/cbi/xxwan/*.lua $(1)/usr/lib/lua/luci/model/cbi/xxwan/
+
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/view/xxwan
+	$(INSTALL_DATA) ./root/usr/lib/lua/luci/view/xxwan/*.htm $(1)/usr/lib/lua/luci/view/xxwan/
 endef
 
 define Package/luci-app-xxwan/postinst

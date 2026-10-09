@@ -54,6 +54,7 @@ usr/lib/lua/luci/model/cbi/xxwan/advanced.lua
 usr/lib/lua/luci/model/cbi/xxwan/log.lua
 usr/lib/lua/luci/model/cbi/xxwan/backup.lua
 usr/lib/lua/luci/model/cbi/xxwan/about.lua
+usr/lib/lua/luci/view/xxwan/svc_buttons.htm
 "
 
 # 这些是可执行文件，需要 755；其余 644
@@ -314,8 +315,15 @@ post_install() {
 	if [ "$WAS_RUNNING" = 1 ]; then
 		log "    检测到服务原本在运行，重启以加载新版本"
 		"$INIT" restart >/dev/null 2>&1 || true
+	elif [ "$(uci -q get xxwan.main.enabled)" = "1" ]; then
+		# 注意：配置默认就是 enabled=1，但安装不主动启动（避免安装瞬间改网络），
+		# 必须把「已启用但未启动」这个状态说清楚，否则用户会以为装完就能用。
+		log "    服务未启动（配置已启用，但安装不会自动启动，避免安装瞬间改变网络）。"
+		log "    立即启动：$INIT start"
+		log "    或到 LuCI「XXWAN 多线策略 → 全局设置」点「启动服务」；重启设备也会自动启动。"
 	else
-		log "    服务未启动（如需启用：uci set xxwan.main.enabled=1 && uci commit xxwan && $INIT start）"
+		log "    服务未启用（xxwan.main.enabled=0），不会启动。"
+		log "    请到 LuCI「XXWAN 多线策略 → 全局设置」勾选「启用 XXWAN」后点「启动服务」。"
 	fi
 	return 0
 }
@@ -331,7 +339,12 @@ do_install() {
 	install_files "$SRC_DIR" 0
 	post_install
 	log "安装完成。浏览器打开: http://<本机IP>/cgi-bin/luci/ → 网络 → XXWAN 多线策略"
-	log "提示：默认未启用（xxwan.main.enabled=0），请在「全局设置」页开启。"
+	if [ "$(uci -q get xxwan.main.enabled)" = "1" ]; then
+		log "提示：配置默认为「已启用」，但安装不会自动启动服务。到「全局设置」页点「启动服务」，"
+		log "      或执行 $INIT start；重启设备也会自动启动。"
+	else
+		log "提示：当前为「未启用」，请到「全局设置」页勾选「启用 XXWAN」后点「启动服务」。"
+	fi
 	return 0
 }
 
@@ -391,6 +404,7 @@ remove_residual() {
 		fi
 	done
 	rm -rf /usr/lib/lua/luci/model/cbi/xxwan 2>/dev/null || true
+	rm -rf /usr/lib/lua/luci/view/xxwan 2>/dev/null || true
 	rm -f /var/log/xxwan.log /tmp/xxwan_state 2>/dev/null || true
 	if [ "$n" -gt 0 ]; then log "    删除文件 $n 个"; fi
 	return 0

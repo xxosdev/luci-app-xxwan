@@ -5,7 +5,7 @@ s.anonymous = true
 
 local d1 = s:option(DummyValue, "_d1", "")
 d1.rawhtml = true
-d1.default = "<h4 style='color:var(--brand); margin-bottom:10px; border-bottom: 1px solid var(--hairline); padding-bottom: 5px;'>切换时的动作</h4>"
+d1.default = "<h4 style='color:var(--brand, var(--primary-color-high, var(--primary, #1976d2))); margin-bottom:10px; border-bottom: 1px solid var(--hairline, var(--border-color-medium, var(--light, #ced4da))); padding-bottom: 5px;'>切换时的动作</h4>"
 
 local flush = s:option(ListValue, "conntrack_flush", translate("清除连接跟踪表"), translate("切换线路时清除已有连接，让连接快速重建。注意：会中断路由器上当前所有网络连接，包括 SSH、网页管理与其他设备的下载和在线游戏。"))
 flush:value("always", translate("每次切换时清除（默认）"))
@@ -23,7 +23,7 @@ s:option(TextValue, "hook_up", translate("线路恢复时执行的脚本"), hook
 
 local d2 = s:option(DummyValue, "_d2", "")
 d2.rawhtml = true
-d2.default = "<h4 style='color:var(--brand); margin-top:30px; margin-bottom:10px; border-bottom: 1px solid var(--hairline); padding-bottom: 5px;'>Webhook 通知</h4>"
+d2.default = "<h4 style='color:var(--brand, var(--primary-color-high, var(--primary, #1976d2))); margin-top:30px; margin-bottom:10px; border-bottom: 1px solid var(--hairline, var(--border-color-medium, var(--light, #ced4da))); padding-bottom: 5px;'>Webhook 通知</h4>"
 
 local md = s:option(ListValue, "webhook_method", translate("请求方式"))
 md:value("GET", "GET"); md:value("POST", "POST"); md.default = "GET"

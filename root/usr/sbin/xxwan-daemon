@@ -134,7 +134,7 @@ sync_network_state() {
         local i_tier=$(echo "$line" | awk '{print $2}' | cut -d':' -f2)
         local i_state=$(echo "$line" | awk '{print $3}' | cut -d':' -f2)
         if [ "$i_state" = "UP" ]; then
-            status_html="${status_html} <span style='display:inline-block; margin-right:15px;'><span style='display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--success); margin-right:5px;'></span><b style='color:var(--text);'>${i_iface}</b> <span style='color:var(--text-muted);'>(Tier ${i_tier} · 在线)</span></span>"
+            status_html="${status_html} <span style='display:inline-block; margin-right:15px;'><span style='display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--success, var(--success-color-high, #2dce89)); margin-right:5px;'></span><b style='color:var(--text, var(--text-color-high, var(--default, #172b4d)));'>${i_iface}</b> <span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>(Tier ${i_tier} · 在线)</span></span>"
             if [ -z "$best_auto_iface" ]; then
                 for t in 1 2 3; do
                     best_auto_iface=$(cat /tmp/xxwan_state 2>/dev/null | grep "TIER:${t} STATUS:UP" | head -n 1 | awk '{print $1}')
@@ -142,7 +142,7 @@ sync_network_state() {
                 done
             fi
         else
-            status_html="${status_html} <span style='display:inline-block; margin-right:15px;'><span style='display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--text-subtle); margin-right:5px;'></span><b style='color:var(--text-muted);'>${i_iface}</b> <span style='color:var(--text-subtle);'>(Tier ${i_tier} · 离线)</span></span>"
+            status_html="${status_html} <span style='display:inline-block; margin-right:15px;'><span style='display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--text-subtle, var(--text-color-low, var(--gray, #8898aa))); margin-right:5px;'></span><b style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>${i_iface}</b> <span style='color:var(--text-subtle, var(--text-color-low, var(--gray, #8898aa)));'>(Tier ${i_tier} · 离线)</span></span>"
         fi
     done < /tmp/xxwan_state
 
@@ -247,8 +247,8 @@ sync_network_state() {
     local svcs=$(uci -q get ${CONF}.advanced.reload_services)
     for svc in $svcs; do [ -n "$svc" ] && log "正在重启关联服务：$svc" && /etc/init.d/"$svc" restart >/dev/null 2>&1; done
 
-    [ -z "$status_html" ] && status_html="<span style='color:var(--text-muted);'>全部离线或未配置接口</span>"
-    if [ "$gmode" != "auto" ]; then status_html="${status_html} <br/><span style='color:var(--info); font-size:12px; margin-top:5px; display:block;'>手动锁定出口：<b>${gmode#force_}</b></span>"; fi
+    [ -z "$status_html" ] && status_html="<span style='color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));'>全部离线或未配置接口</span>"
+    if [ "$gmode" != "auto" ]; then status_html="${status_html} <br/><span style='color:var(--info, var(--primary-color-high, var(--primary, #5e72e4))); font-size:12px; margin-top:5px; display:block;'>手动锁定出口：<b>${gmode#force_}</b></span>"; fi
     uci set ${CONF}.status.active_nodes="${status_html}"
     uci set ${CONF}.status.last_event="$(date '+%H:%M:%S') - $event_msg"
     uci commit ${CONF}

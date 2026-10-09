@@ -6,7 +6,7 @@ uci:foreach("xxwan", "interface", function(sec) has_iface = true end)
 
 local descr = "为指定设备或目标配置固定出口。留空则所有流量按全局出口策略。"
 if not has_iface then
-    descr = descr .. " <span style='color:var(--danger);'>尚未配置任何线路，请先在「线路接口」页添加。</span>"
+    descr = descr .. " <span style='color:var(--danger, var(--error-color-high, #f5365c));'>尚未配置任何线路，请先在「线路接口」页添加。</span>"
 end
 
 local m = Map("xxwan", translate("分流规则"), translate(descr))
@@ -18,8 +18,8 @@ local note = s_note:option(DummyValue, "_rule_note", "")
 note.rawhtml = true
 note.cfgvalue = function(self, section)
     return [[
-        <div style="line-height:1.9; color:var(--text-muted);">
-            <div style="color:var(--text);">规则按列表顺序匹配，第一条命中的生效。</div>
+        <div style="line-height:1.9; color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));">
+            <div style="color:var(--text, var(--text-color-high, var(--default, #172b4d)));">规则按列表顺序匹配，第一条命中的生效。</div>
             <div>未命中任何规则的流量，按「全局设置」中的出口选择方式处理。</div>
             <div>条件留空表示该条件匹配所有流量。</div>
             <div>勾选「固定出口」后，即使该线路离线也不切换，该流量会中断。</div>
