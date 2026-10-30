@@ -21,6 +21,16 @@ log_append() {
     printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
 }
 
+# 详细探测日志开关（默认关）。
+# ★ 线路稳定离线时，每轮探测都会失败；若每次都记一条，10 秒一条、500 行日志
+#   大约 40 分钟就被刷满，把真正有用的事件（切换、恢复）全挤掉 —— 现场表现就是
+#   「日志一片空白，看不出插件到底在干什么」。所以默认只记状态变化，
+#   需要排查「为什么这条线一直显示离线」时，在「全局设置 → 高级参数」临时打开。
+#   值在主循环里每轮重读，改完不用重启引擎。
+VERBOSE_LOG=$(uci -q get ${CONF}.main.verbose_probe_log 2>/dev/null)
+[ "$VERBOSE_LOG" = "1" ] || VERBOSE_LOG=0
+logv() { [ "$VERBOSE_LOG" = "1" ] && log "$1"; return 0; }
+
 # ── 通用小工具 ────────────────────────────────────────────────────────
 
 # 数值型 UCI 读取 + 钳制：$1=路径 $2=默认 $3=下限 $4=上限
@@ -585,6 +595,67 @@ if [ "$1" = "v6name" ]; then
     exit 0
 fi
 
+# ── 默认路由管理（出口切换 / 自愈）──────────────────────────────────────
+# ★★ 这一段是 2026-10-29 真机事故（192.0.2.1）的直接产物，改动前务必读完：
+#
+#   原实现：`ip route show | grep "metric 1" | grep "default" | ... ip route del`
+#   问题 ①：`grep` 是**子串匹配** —— `metric 10` / `metric 100` / `metric 1xx` 全部命中。
+#           用户给线路配 `network.wan1.metric='10'`（多 WAN 的标准写法）时，netifd 装的
+#           `default via <gw> dev lan1 metric 10` 被当成 xxwan 自己的路由删掉。
+#   问题 ②：该线路失去默认路由后，探测用的 `ping -I lan1` 找不到网关、退化成直连发 ARP
+#           → 100% 丢包 → 判定离线 → 出口切走。
+#   问题 ③：netifd 认为路由还在（ubus status 里 route 字段仍有），**不会重装** →
+#           该线路永久离线，只能人工救。用户看到的是「明明能上网，却显示离线」。
+#   问题 ④：`init.d/xxwan` 的 service_stopped() 里有一模一样的写法 → 停服务即断网。
+#
+#   现在的做法：
+#   ① 切换出口用 `ip route replace`（按 dst+metric 原子替换，不删除、无空窗、
+#      完全不碰 metric 0/10/100 的路由）；
+#   ② 确实需要删除时（全部离线 / 停服务），用 awk **精确匹配完整字段** `metric 1`，
+#      并排除 netifd 的 `proto static|dhcp|kernel`。
+#
+#   ⚠ 两条禁令：
+#   ① 不要改回 `grep "metric 1"`（子串会吃掉 metric 10/100/1xx）。
+#   ② 不要用 `ip route show proto 66` 来识别自己的路由 —— busybox ip 会**静默忽略**
+#      `proto`（加进去也不生效），且 `show proto 66` **不过滤**（实测返回全部路由），
+#      照此删除会把所有 default 删光。真机实测见 2026-10-29 记录。
+
+# 列出「xxwan 自己加的」默认路由（metric 恰好为 1，且不是 netifd 下发的）
+xxwan_own_default() {
+    ip route show 2>/dev/null | grep default \
+        | awk '$0 ~ /(^| )metric 1( |$)/ && $0 !~ /proto (static|dhcp|kernel)/'
+}
+
+# 删掉自己的默认路由（全部离线 / 停服务时用）。绝不碰 netifd 的兜底路由。
+xxwan_clear_own_default() {
+    xxwan_own_default | while read -r _l; do
+        [ -z "$_l" ] && continue
+        ip route del $_l 2>/dev/null
+    done
+}
+
+# 自愈：线路有地址却没有默认路由 → 说明 netifd 下发的路由被外部删掉了
+# （老版本 xxwan 误删、手工操作、或别的插件），netifd 不会自己补。
+# 此时 ifup 一次，让 netifd 重新下发。
+# ★ 只在「有地址」时才做：没地址说明接口本身没起来，ifup 也没用，白折腾。
+# ★★ ifup 会把该接口上**所有**路由清掉重装 —— 包括 xxwan 自己那条 metric 1 出口路由。
+#    所以 ifup 之后必须让调用方触发一次 sync 重新选出口，否则出口路由会短暂缺失。
+#    这里用全局标志 ROUTE_REPAIRED 通知调用方（同进程内传递）。
+ROUTE_REPAIRED=0
+xxwan_ensure_default() {
+    local _if="$1"
+    local _dev=$(iface_dev "$_if")
+    [ -z "$_dev" ] && return 1
+    local _ip=$(iface_ip "$_if")
+    [ -z "$_ip" ] && return 1
+    ip route show 2>/dev/null | grep default | grep -q "dev $_dev" && return 0
+    log "线路 $_if 有地址($_ip)但缺少默认路由（可能被外部删除），尝试 ifup 重建"
+    ifup "$_if" >/dev/null 2>&1
+    # 等 netifd 把地址/路由装回去，再让调用方重新同步出口
+    sleep 2
+    ROUTE_REPAIRED=1
+}
+
 check_iface() {
     local iface="$1"; local c_type="$2"; local c_tgt="$3"; local c_url="$4"; local c_code="$5"
     local dev=$(ubus call network.interface."$iface" status 2>/dev/null | jsonfilter -e '@["l3_device"]')
@@ -635,18 +706,29 @@ sync_network_state() {
     [ -z "$log_best_iface" ] && log_best_iface="无（全部离线）"
     log "当前出口：$log_best_iface"
 
-    ip route show | grep "metric 1" | grep "default" | while read -r line; do ip route del $line 2>/dev/null; done
+    # ── 切换出口 ──
+    # ★ 用 replace 而不是「先删后加」：
+    #   ① replace 按 (目标, metric) 原子替换 —— 只影响 metric 1 的那一条，
+    #      netifd 下发的 metric 0/10/100 兜底路由原封不动（这就是 10-29 事故的修复点）；
+    #   ② 没有「删完到加之前」的空窗（原写法在这个间隙里所有流量都没有默认路由）；
+    #   ③ replace 是 iproute 的基础子命令，iproute2 各版本与 busybox ip 都支持。
+    #   后面跟 add 是保险：极老实现若不认 replace，退回 add 也能起来。
     if [ -n "$best_iface" ]; then
         local alive_gw=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@["route"][0]["nexthop"]')
         local alive_dev=$(ubus call network.interface."$best_iface" status 2>/dev/null | jsonfilter -e '@["l3_device"]')
         if [ -n "$alive_dev" ]; then
             if [ -n "$alive_gw" ] && [ "$alive_gw" != "0.0.0.0" ]; then
-                ip route add default via "$alive_gw" dev "$alive_dev" metric 1 2>/dev/null
+                ip route replace default via "$alive_gw" dev "$alive_dev" metric 1 2>/dev/null \
+                    || ip route add default via "$alive_gw" dev "$alive_dev" metric 1 2>/dev/null
             else
                 log "线路 $best_iface 无网关，改用直连设备路由"
-                ip route add default dev "$alive_dev" metric 1 2>/dev/null
+                ip route replace default dev "$alive_dev" metric 1 2>/dev/null \
+                    || ip route add default dev "$alive_dev" metric 1 2>/dev/null
             fi
         fi
+    else
+        # 全部离线：只撤掉自己那条，netifd 的兜底保留
+        xxwan_clear_own_default
     fi
 
     # ── 出口切换事件 ──
@@ -839,6 +921,9 @@ for if_sec in $IFACES; do
         echo "${ifname} TIER:${tier} STATUS:UP 0 ${ok_cnt}" >> /tmp/xxwan_state
     else
         echo "${ifname} TIER:${tier} STATUS:DOWN ${FAIL_THRESH} 0" >> /tmp/xxwan_state
+        # 首轮就判离线时也查一次路由自愈：老版本误删过 netifd 的路由时，
+        # 重启后如果只等主循环「每 60 轮一次」，要 10 分钟才能修回来。
+        xxwan_ensure_default "$ifname"
     fi
 done
 log "首轮快速探测完成（每条线路探测 $FAIL_THRESH 次）"
@@ -858,8 +943,14 @@ while true; do
     case "$REST_THRESH" in ''|*[!0-9]*) REST_THRESH=3 ;; esac
     [ "$REST_THRESH" -lt 1 ] && REST_THRESH=1
 
+    # 详细探测日志开关每轮重读：页面上改完即时生效，不必重启引擎
+    VERBOSE_LOG=$(uci -q get ${CONF}.main.verbose_probe_log 2>/dev/null)
+    [ "$VERBOSE_LOG" = "1" ] || VERBOSE_LOG=0
+
     STATE_CHANGED=0
     LAST_EVT="init"
+    # 本轮是否因自愈触发过 ifup（ifup 会清掉 xxwan 自己的出口路由，需要重新同步）
+    ROUTE_REPAIRED=0
     # 本轮状态变化的方向标志（给 sync_network_state 判断「仅线路恢复时清除」用，
     # 取代原来那个会被循环覆盖、结果不确定的 LAST_EVT）
     HAS_UP=0
@@ -927,18 +1018,40 @@ while true; do
                     run_hook "down" "$ifname" ""
                     STATE_CHANGED=1
                     LAST_EVT="down"
+                    # 判离线时顺手查一次：若这条线「有地址却没有默认路由」，
+                    # 说明 netifd 下发的路由被外部删掉了（老版本 xxwan 的误删、
+                    # 手工操作或别的插件），netifd 不会自己补 —— ifup 一次重建。
+                    xxwan_ensure_default "$ifname"
                 else
                     new_status="STATUS:UP"
                     log "线路 $ifname 探测失败（$fail_cnt/$FAIL_THRESH），待确认离线…"
                 fi
             else
                 new_status="STATUS:DOWN"
+                # 已稳定离线：默认不写日志。
+                # ★ 原实现这里什么都不记，于是「线路一直离线」时日志完全空白，
+                #   现场看起来像插件没在跑（10-29 事故的第二个投诉点）。
+                #   现在改为受 verbose_probe_log 开关控制，默认仍安静。
+                logv "线路 $ifname 仍离线（累计失败 $fail_cnt 次）"
+                # 每 60 轮（约 5~10 分钟）尝试一次路由自愈：
+                # 有地址却没有默认路由 → netifd 的路由被外部删了，ifup 让它重新下发。
+                # 不每轮都做，否则 ifup 会把接口反复 down/up。
+                if [ $((fail_cnt % 60)) -eq 0 ]; then
+                    xxwan_ensure_default "$ifname"
+                fi
             fi
         fi
         echo "${ifname} TIER:${tier} ${new_status} ${fail_cnt} ${rest_cnt}" >> /tmp/xxwan_state_new
     done
 
     mv /tmp/xxwan_state_new /tmp/xxwan_state
+
+    # 自愈触发过 ifup → ifup 把该接口上的路由（含 xxwan 自己的 metric 1 出口路由）
+    # 一起清掉重装了，必须重新同步一次出口，否则出口路由会缺失到下一次状态变化。
+    if [ "$ROUTE_REPAIRED" = "1" ]; then
+        STATE_CHANGED=1
+        log "自愈已重建线路路由，重新同步出口"
+    fi
 
     if [ "$STATE_CHANGED" -eq 1 ] || [ "$FIRST_RUN" -eq 1 ]; then
         sync_network_state "线路状态变化或引擎重启" "$LAST_EVT"

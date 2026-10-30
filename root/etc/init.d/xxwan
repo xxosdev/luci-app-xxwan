@@ -26,7 +26,14 @@ stop_service() { :; }
 # 也避免在 stop_service 里自己调 procd_kill —— 那样 rc.common 随后再调一次会报
 # "ubus call service delete ... (Not found)"。
 service_stopped() {
-    ip route show | grep "metric 1" | grep "default" | while read -r line; do ip route del $line 2>/dev/null; done
+    # ★ 只删 xxwan 自己加的那条默认路由（metric **恰好**为 1，且不是 netifd 下发的）。
+    #   原写法 `grep "metric 1"` 是子串匹配：`metric 10` / `100` / `1xx` 全部命中，
+    #   于是「停服务」等于「把 netifd 的默认路由一起删掉」= 断网，而且 netifd
+    #   认为路由还在、不会重装（2026-10-29 真机事故）。
+    #   改成精确匹配后，停服务会让流量回落到 netifd 的默认路由，不再断网。
+    ip route show | grep default \
+        | awk '$0 ~ /(^| )metric 1( |$)/ && $0 !~ /proto (static|dhcp|kernel)/' \
+        | while read -r line; do ip route del $line 2>/dev/null; done
     uci show pbr | grep -E "=policy" | cut -d'.' -f2 | cut -d'=' -f1 | grep "^xxwan_" | while read -r section; do uci delete pbr.${section}; done
     uci commit pbr
     /etc/init.d/pbr reload >/dev/null 2>&1

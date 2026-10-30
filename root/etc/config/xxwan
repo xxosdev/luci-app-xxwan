@@ -6,6 +6,7 @@ config main 'main'
 	option global_mode 'auto'
 	option strict_enforcement '1'
 	option ipv6_enabled '0'
+	option verbose_probe_log '0'
 
 config status 'status'
 	option active_nodes ''

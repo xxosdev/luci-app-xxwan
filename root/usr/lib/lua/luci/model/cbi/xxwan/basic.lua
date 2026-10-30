@@ -130,4 +130,59 @@ s_adv:option(Value, "check_interval", translate("探测间隔（秒）")).defaul
 s_adv:option(Value, "fail_threshold", translate("判定离线所需失败次数")).default = "3"
 s_adv:option(Value, "restore_threshold", translate("判定恢复所需成功次数")).default = "3"
 
+-- ★ 详细探测日志开关（默认关）。
+--   线路稳定离线时每轮探测都失败，如果每次都记一条，500 行日志大约 40 分钟就被刷满，
+--   真正有用的事件（切换、恢复）反而被挤掉 —— 现场表现就是「日志一片空白」。
+--   所以默认只记状态变化；排查「这条线为什么一直离线」时再临时打开。
+local vlog = s_adv:option(Flag, "verbose_probe_log", translate("记录详细探测日志"),
+    translate("默认关闭。关闭时只记录线路状态变化（离线 / 恢复 / 出口切换），日志干净。" ..
+        "开启后每轮探测失败都会记一条：线路稳定离线时约每 10 秒一条，日志上限 500 行，" ..
+        "大约 40 分钟就会滚完。仅在排查「某条线路一直显示离线」时临时打开，查完记得关掉。"))
+vlog.default = "0"; vlog.rmempty = false
+
+-- ★ 线路接口 metric 检查（2026-10-29 真机事故的防复发提示）。
+--   XXWAN 用 metric 1 抢占默认出口，所以线路自身的 metric 必须大于 1：
+--   · 未配置（=0）：netifd 下发的默认路由永远压过 XXWAN 的 metric 1 → 出口切换静默失效；
+--   · =1：与 XXWAN 抢同一条默认路由，老版本会直接把它删掉（就是那次「明明能上网却显示离线」）。
+--   只看「确实带默认路由」的接口：EasyTier 这类虚拟接口本身没有 default，不参与比较。
+local metric_chk = s_adv:option(DummyValue, "_metric_chk", translate("线路接口 metric 检查"))
+metric_chk.template = "cbi/dvalue"
+metric_chk.rawhtml = true
+function metric_chk.cfgvalue(self, section)
+    local ok, bad = {}, {}
+    uci:foreach("xxwan", "interface", function(sec)
+        local name = sec.ifname
+        if not name or name == "" then return end
+        local out = sys.exec(string.format(
+            "ubus call network.interface.%s status 2>/dev/null | " ..
+            "jsonfilter -e '@[\"route\"][*][\"target\"]' 2>/dev/null", name))
+        if not out or not out:find("0.0.0.0", 1, true) then return end
+        local mv = uci:get("network", name, "metric")
+        if mv == nil or mv == "" then
+            bad[#bad + 1] = name .. translate("（未配置，等于 0）")
+        elseif mv == "0" or mv == "1" then
+            bad[#bad + 1] = name .. "（metric = " .. mv .. "）"
+        else
+            ok[#ok + 1] = name .. "（metric = " .. mv .. "）"
+        end
+    end)
+    local muted = "color:var(--text-muted, var(--text-color-medium, var(--gray, #8898aa)));"
+    local good  = "color:var(--success, var(--success-color-high, #2dce89));"
+    local badc  = "color:var(--danger, var(--error-color-high, #f5365c));font-weight:bold;"
+    if #bad == 0 then
+        if #ok == 0 then
+            return "<span style='" .. muted .. "'>" ..
+                translate("未检测到带默认路由的线路接口（虚拟接口不参与比较）") .. "</span>"
+        end
+        return "<span style='" .. good .. "'>" .. translate("正常：") ..
+            table.concat(ok, "、") .. "</span>"
+    end
+    return "<span style='" .. badc .. "'>" .. translate("需要调整：") ..
+        table.concat(bad, "、") .. "</span><br><span style='" .. muted .. "'>" ..
+        translate("XXWAN 用 metric 1 抢占默认出口，线路自身的 metric 必须大于 1：" ..
+            "为 0 时永远压不过 XXWAN（出口切换不生效）；为 1 时会互相抢占。" ..
+            "请在「网络 → 接口」里把这些接口的 metric 改成 2 以上（推荐 10 / 20 / 100）。") ..
+        "</span>"
+end
+
 return m
