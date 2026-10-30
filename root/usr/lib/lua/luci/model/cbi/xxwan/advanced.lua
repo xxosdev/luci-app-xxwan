@@ -134,8 +134,8 @@ s:option(Value, "webhook_url", translate("Webhook 地址"),
         "IPv6：$WAN_IPV6（该线路 WAN 口地址）、$WAN_PREFIX6（该线路拿到的委派前缀 PD）、$PUBLIC_IPV6（公网出口 IPv6）；" ..
         "通用：$EVENT、$IFACE、$TIER、$TIME、$HOSTNAME、$OLD_IFACE、$NEW_IFACE。" ..
         "旧别名 $IP = $WAN_IP、$IPV6 = $WAN_IPV6 仍然可用。" ..
-        "★ $WAN_IPV6 / $WAN_PREFIX6 / $PUBLIC_IPV6 三者**互不相同**（真机实测）：" ..
-        "$WAN_IPV6 是 OpenWrt 那个独立 wan6 接口上 WAN 侧的 /64 地址（如 2001:db8:aa01:1:…）；" ..
+        "★ $WAN_IPV6 / $WAN_PREFIX6 / $PUBLIC_IPV6 三者**互不相同**（典型取值，示例用文档保留前缀）：" ..
+        "$WAN_IPV6 是 OpenWrt 那个独立 wan6 接口上 WAN 侧的 /64 地址（如 2001:db8:aa01:1::）；" ..
         "$WAN_PREFIX6 是运营商委派给 LAN 的整段 PD（如 2001:db8:bb00::/60），双宽带时每条线各有一个；" ..
         "$PUBLIC_IPV6 是路由器实际对外用的地址，通常落在 PD 里面。" ..
         "要汇报「外面看到的地址」用 $PUBLIC_IPV6；要汇报「这条线拿到哪个网段」用 $WAN_PREFIX6。"))
